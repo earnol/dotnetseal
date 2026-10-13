@@ -1,0 +1,17 @@
+.reportseal-form { display: grid; gap: .5rem; margin: 0 0 1.5rem; }
+.reportseal-form textarea { font: 13px/1.4 ui-monospace, monospace; width: 100%;
+    min-height: 4.5rem; padding: .5rem; box-sizing: border-box; }
+.reportseal-form button { justify-self: start; font: inherit; padding: .4rem 1rem; cursor: pointer; }
+.reportseal-status { min-height: 1.5rem; font-size: .9375rem; margin: 0; }
+.reportseal-status.err { color: #c0392b; }
+.reportseal-status.ok { color: #1e8449; }
+.reportseal-locked { color: #8a8a8a; font-style: italic; }
+.reportseal-attribution { color: #8a8a8a; font-size: .875rem; margin: 0 0 1rem; }
+.reportseal-remembered { color: #8a8a8a; font-size: .875rem; margin: 0 0 1rem; }
+.reportseal-forget { font: inherit; font-size: .875rem; padding: .1rem .5rem; cursor: pointer; }
+.reportseal-expiry { border-left: 3px solid #b7950b; background: #b7950b1a;
+    margin: 0 0 1.5rem; padding: .6rem .8rem; font-size: .9375rem; }
+.reportseal-expiry.expired { border-left-color: #c0392b; background: #c0392b1a; }
+.reportseal-keydata { border-top: 1px solid #8884; margin-top: 2rem; padding-top: 1rem; }
+.reportseal-keydata dt { font-weight: 600; }
+.reportseal-keydata dd { margin: 0 0 .5rem; font-family: ui-monospace, monospace; }

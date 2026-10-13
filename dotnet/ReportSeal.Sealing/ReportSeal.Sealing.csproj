@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>ReportSeal.Sealing</RootNamespace>
+    <AssemblyName>ReportSeal.Sealing</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- so the self-test can exercise BeginSealInternal without it being public;
+         this must name the assembly, not the project -->
+    <InternalsVisibleTo Include="reportseal-selftest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Pure managed BLS12-381, MIT, with a netstandard2.1 target. Used instead of
+         hand-writing tower field arithmetic and curve operations. -->
+    <PackageReference Include="Neo.Cryptography.BLS12_381" Version="3.9.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The page's CSS and JavaScript ship inside the assembly. Scripts are
+         concatenated in the order given by UnlockAssets.ScriptFiles. -->
+    <EmbeddedResource Include="assets/unlock.css" LogicalName="ReportSeal.Sealing.assets.unlock.css" />
+    <EmbeddedResource Include="assets/bls12-381.js" LogicalName="ReportSeal.Sealing.assets.bls12-381.js" />
+    <EmbeddedResource Include="assets/unlock.js" LogicalName="ReportSeal.Sealing.assets.unlock.js" />
+  </ItemGroup>
+
+</Project>
