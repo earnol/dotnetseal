@@ -1,4 +1,4 @@
-# reportseal — POC
+# .NET sealer - Proof of Concept
 
 A .NET generator seals part of a web page; a PHP issuer mints unlimited keys that
 open it; the browser decrypts on `file://` with WebCrypto and no dependencies.
