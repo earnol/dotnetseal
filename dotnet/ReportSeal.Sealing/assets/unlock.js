@@ -38,7 +38,7 @@
   // Remembering the key. Scoped to this page id so two documents opened from the
   // same machine never pick up each other's key. Every access is guarded: storage
   // can be absent or throw outright, and that must never stop a manual unlock.
-  var storeKey = "reportseal/v2/" + d.epoch + "/" + d.page;
+  var storeKey = "reportseal/v2/" + d.epochs + "/" + d.page;
 
   function recall() {
     try { return window.localStorage.getItem(storeKey); } catch (e) { return null; }
@@ -89,9 +89,14 @@
     if (payload.v !== 2) {
       throw new Error("Key format v" + payload.v + " is not one this page understands.");
     }
-    if (payload.epoch !== d.epoch) {
+    // A page may be sealed under several epochs; a key from any of them opens it.
+    // The epoch list and the C1 list are in the same order, so the token's epoch
+    // picks which C1 to pair with its element.
+    var epochs = String(d.epochs).split("+");
+    var slot = epochs.indexOf(payload.epoch);
+    if (slot < 0) {
       throw new Error("Key belongs to epoch '" + payload.epoch +
-                      "'; this page was sealed under '" + d.epoch + "'.");
+                      "'; this page was sealed under '" + epochs.join("', '") + "'.");
     }
     if (payload.page !== d.page) {
       throw new Error("Key was issued for page '" + payload.page +
@@ -121,7 +126,7 @@
     var sk, c1;
     try {
       sk = B.G1.Point.fromBytes(b64uToBytes(payload.sk));
-      c1 = B.G2.Point.fromBytes(b64uToBytes(d.c1));
+      c1 = B.G2.Point.fromBytes(b64uToBytes(String(d.c1).split("+")[slot]));
     } catch (e) {
       throw new Error("Key rejected: its page element is malformed.");
     }
@@ -131,13 +136,13 @@
     var ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
     var kBits = await crypto.subtle.deriveBits({
       name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0),
-      info: enc.encode("reportseal/v2|" + d.epoch + "|" + d.page)
+      info: enc.encode("reportseal/v2|" + d.epochs + "|" + d.page)
     }, ikm, 256);
     var key = await crypto.subtle.importKey("raw", kBits, "AES-GCM", false, ["decrypt"]);
 
     var plain = await crypto.subtle.decrypt({
       name: "AES-GCM", iv: b64uToBytes(d.iv), tagLength: 128,
-      additionalData: enc.encode(d.epoch + "|" + d.page)
+      additionalData: enc.encode(d.epochs + "|" + d.page)
     }, key, b64uToBytes(ct));
 
     // 5. The fragment may have been compressed before it was encrypted. That is a

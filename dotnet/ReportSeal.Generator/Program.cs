@@ -37,7 +37,10 @@ internal static class Program
                   --hidden <file>   HTML fragment to encrypt (required)
                   --out <file>      page to write (required)
                   --table <file>    published key table (default ../../keys/epochs.json)
-                  --epoch <id>      epoch from the table (default: the last one listed)
+                  --epoch <ids>     epoch, or several joined with '+' as in E1+E3;
+                                    a key from any of them opens the page
+                                    (default: the last epoch listed in the table)
+                  --max-epochs <n>  guard against a runaway list (default 3)
                   --title <text>    page title and heading
                   --header <file>   HTML fragment for the visible header
                   --no-compress     store the fragment uncompressed (wider browser support)
@@ -48,22 +51,35 @@ internal static class Program
         }
 
         var table = JsonNode.Parse(File.ReadAllText(opt.Table))!.AsObject();
-        var epochs = table["epochs"]!.AsObject();
-        var epoch = opt.Epoch ?? epochs.Select(e => e.Key).LastOrDefault()
-            ?? throw new InvalidOperationException($"{opt.Table} lists no epochs — run php/setup.php");
-        if (!epochs.TryGetPropertyValue(epoch, out var mpkNode) || mpkNode is null)
+        var published = table["epochs"]!.AsObject();
+        var wanted = (opt.Epoch ?? published.Select(e => e.Key).LastOrDefault()
+            ?? throw new InvalidOperationException($"{opt.Table} lists no epochs — run php/setup.php"))
+            .Split('+', StringSplitOptions.RemoveEmptyEntries);
+
+        if (wanted.Length > opt.MaxEpochs)
         {
             throw new InvalidOperationException(
-                $"epoch '{epoch}' is not in {opt.Table} (have: {string.Join(", ", epochs.Select(e => e.Key))})");
+                $"{wanted.Length} epochs requested but --max-epochs is {opt.MaxEpochs}; "
+                + "a page readable under that many epochs is usually a mistake");
         }
+
+        var epochs = wanted.Select(id =>
+        {
+            if (!published.TryGetPropertyValue(id, out var mpk) || mpk is null)
+            {
+                throw new InvalidOperationException(
+                    $"epoch '{id}' is not in {opt.Table} "
+                    + $"(have: {string.Join(", ", published.Select(e => e.Key))})");
+            }
+            return new EpochKey(id, Base64Url.Decode((string)mpk!));
+        }).ToArray();
 
         var plaintext = File.ReadAllBytes(opt.Hidden);
 
         var fragment = Sealer.Seal(
             plaintext,
-            epoch,
+            epochs,
             opt.Page,
-            Base64Url.Decode((string)mpkNode!),
             (string)table["signpublic"]!["x"]!,
             (string)table["signpublic"]!["y"]!,
             new SealOptions
@@ -81,13 +97,26 @@ internal static class Program
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(opt.Out))!);
         File.WriteAllText(opt.Out, page, new UTF8Encoding(false));
 
-        Console.WriteLine($"epoch   : {epoch}");
-        Console.WriteLine($"page id : {opt.Page}");
+        Console.WriteLine($"epochs  : {string.Join(", ", epochs.Select(e => e.Id))}");
+        Console.WriteLine($"page id : {opt.Page}  (identity {PageFingerprint(opt.Page)})");
         Console.WriteLine($"element : {fragment.ElementId}");
         Console.WriteLine($"hidden  : {plaintext.Length} bytes sealed"
             + (opt.NoCompress ? " uncompressed" : " gzipped"));
         Console.WriteLine($"written : {Path.GetFullPath(opt.Out)} ({new FileInfo(opt.Out).Length} bytes)");
         return 0;
+    }
+
+    /// <summary>
+    /// Short fingerprint of the exact bytes the page id hashes to, matching what
+    /// php/issue.php prints. Two ids that look alike but differ in Unicode
+    /// composition produce different identities, and without this the only symptom
+    /// is a key that will not open its page.
+    /// </summary>
+    private static string PageFingerprint(string pageId)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var digest = sha.ComputeHash(Encoding.UTF8.GetBytes("reportseal/v2|" + pageId));
+        return Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 12);
     }
 
     /// <summary>
@@ -140,7 +169,7 @@ internal static class Program
 
     private sealed record Options(
         string Page, string Hidden, string Out, string Table, string? Epoch, string Title, string? Header,
-        bool NoAttribution, bool EnforceExpiry, bool NoCompress)
+        bool NoAttribution, bool EnforceExpiry, bool NoCompress, int MaxEpochs)
     {
         public static Options? Parse(string[] args)
         {
@@ -150,6 +179,7 @@ internal static class Program
             var noAttribution = false;
             var enforceExpiry = false;
             var noCompress = false;
+            var maxEpochs = 3;
 
             for (var i = 0; i < args.Length; i++)
             {
@@ -163,6 +193,7 @@ internal static class Program
                     case "--epoch": epoch = next; i++; break;
                     case "--title": title = next!; i++; break;
                     case "--header": header = next; i++; break;
+                    case "--max-epochs": maxEpochs = int.Parse(next!); i++; break;
                     case "--no-compress": noCompress = true; break;
                     case "--no-attribution": noAttribution = true; break;
                     case "--enforce-expiry": enforceExpiry = true; break;
@@ -171,7 +202,7 @@ internal static class Program
             }
             if (hidden is null || output is null || page is null) return null;
             return new Options(page, hidden, output, Path.GetFullPath(table), epoch, title, header,
-                noAttribution, enforceExpiry, noCompress);
+                noAttribution, enforceExpiry, noCompress, maxEpochs);
         }
     }
 }

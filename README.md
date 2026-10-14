@@ -23,7 +23,7 @@ dotnet/ReportSeal.Sealing/assets/  unlock.js and unlock.css, embedded as resourc
 dotnet/ReportSeal.Generator/  runnable CLI host (net10.0): I/O, key table, page assembly
 dotnet/ReportSeal.SelfTest/   pairing constant, stepwise sealing and thread-safety checks
 samples/                  example header and hidden fragment
-test/setup.sh             build the key fixtures the suite needs (epochs E1 and E2)
+test/setup.sh             build the key fixtures the suite needs (epochs E1, E2 and E3)
 test/e2e.sh               full pipeline verified in headless Chrome on file://
 ```
 
@@ -171,7 +171,7 @@ reads `test/env.sh` if you provide one, as described in `test/env.sh.example`.
 To run the tests:
 
 ```bash
-test/setup.sh      # once: signing key plus epochs E1 and E2
+test/setup.sh      # once: signing key plus epochs E1, E2 and E3
 test/e2e.sh        # the suite; refuses to run until the fixtures exist
 ```
 
@@ -189,7 +189,7 @@ php php/setup.php                 # signing key + master scalar for epoch E1
 php php/issue.php --page DOC-1234 --kid acct-4471 --name 'A. Example'
 
 cd dotnet/ReportSeal.Generator
-dotnet run -- --page DOC-1234 --hidden ../../samples/hidden.html \
+dotnet run -- --page DOC-1234 --epoch E1 --hidden ../../samples/hidden.html \
               --header ../../samples/header.html \
               --title "Quarterly Summary" --out ../../out/page.html
 ```
@@ -233,14 +233,29 @@ and `sk` are crypto; everything else is metadata in `extra`. The page shows
 else beneath the content. About 414 characters; minting one takes ~1 s,
 almost all of it the G1 multiply.
 
-**Sealing (.NET, public key only).** Pick an ephemeral `k`, emit
-`C1 = k*(X + id*G2)`, and derive the content key from `e(G1,G2)^k`. Note where the
+**Sealing (.NET, public key only).** `Sealer.Seal` takes an `EpochKey[]` — a name
+and that epoch's `X` together, at least one entry — and a key issued for **any**
+listed epoch opens the page. Pick an ephemeral `k`, emit `C1 = k*(X + id*G2)` per
+epoch, and derive the content key from `e(G1,G2)^k`. Note where the
 epoch lives: `X` appears only in `C1`, computed fresh every time from the published
 table. The shared value is `e(G1,G2)^k`, which contains no epoch and no page — the
 `(s+id)` factors cancel in `e(sk, C1)` — so `e(G1,G2)` is a constant of the curve
 itself and is embedded rather than computed. Rotating an epoch changes `X` and
-therefore `C1`; it cannot change that constant. The suite seals under a second
-epoch and opens it to keep that honest. Key derivation is
+therefore `C1`; it cannot change that constant. It is also why several epochs share
+one ciphertext: the shared value is the same for all of them, so only `C1` is
+per-epoch. The page carries `data-epochs="E1+E2"` and a matching `+`-joined list of
+`C1` values, and the browser uses the one at its token's position. For a single
+epoch the derivation string is byte-identical to the one-epoch form, so nothing
+changes for pages sealed under one.
+
+Listing an old epoch beside a new one keeps old keys working **for that page** —
+useful as a transition window, and the opposite of what rotation is for. The
+generator refuses more than `--max-epochs` (default 3) to catch mistakes.
+
+The suite keeps this honest from both directions: it seals a page under `E1+E2` and
+opens it with a key from either, and seals one under `E1+E3` where a perfectly
+valid `E2` key is refused — by the page's own check, and with that check patched
+out, by AES-GCM failing to authenticate. Key derivation is
 `HKDF-SHA256(info = "reportseal/v2|<epoch>|<pageId>")`, then AES-256-GCM with
 `aad = "<epoch>|<pageId>"`. Sealing performs **no pairing at all**; the browser
 performs exactly one.
@@ -305,12 +320,53 @@ key id. What each one does:
 |---|---|---|
 | User name | `extra.name` | yes, in the header |
 | User institution | `extra.institution` | yes, in the header |
-| Expiry date | `exp` | yes, in the header |
+| Expiry date and time | `exp` | yes, in the header |
 | Page id | `page` | no, but it is what the key opens |
 | Key id | `kid` | no |
 
-Blank name or institution becomes `unknown`; a blank expiry becomes `9999-12-31`,
-which reads as "does not expire". Blank key id generates a random `K-xxxxxxxx`.
+Blank name or institution becomes `unknown`. Blank key id generates a random
+`K-xxxxxxxx`.
+
+Expiry is a **UTC moment**, entered as a date plus an hours-and-minutes time. Both
+default to two months from the instant the form loads, carrying the time of day
+with them: a key minted at 15:04 UTC expires at 15:04 UTC. Enter `9999-12-31` for
+a key that never expires. The time field is `type="time"` with `step="60"`, so
+seconds are never offered, and it carries `lang="en-GB"` because HTML has no
+attribute that forces 24-hour display and Chrome takes the format from the
+element's language. The submitted value is `HH:MM` on a 24-hour clock regardless,
+and anything else is rejected.
+
+### Characters
+
+Page ids and key ids are a whitelist: letters, digits and combining marks in any
+script, plus `_ . : -`. Everything else is refused, including whitespace and
+`% & * ' " + | < > / \ ? # = ;`. `|` and `+` separate fields in the derivation
+string, and the rest have no business in an identifier. Both the issuer and the
+generator apply the same rule, so a page cannot be sealed under an id no key could
+be issued for. Names and institutions are free text and take anything.
+
+Names, institutions, page ids and key ids take letters in any script, so
+`Åsa Müller-Désirée` of `Universität Göttingen` with a page id of
+`DOC-Årsrapport` works end to end and into the page header. Tokens carry them as
+UTF-8 rather than `\uXXXX` escapes, which costs an accented letter 2 bytes instead
+of 6 characters — 43 characters off a token carrying those names.
+
+Epoch ids stay ASCII (`A-Za-z0-9_.-`) on purpose: one names a file in
+`keys/private/`, and they are joined with `+` into the derivation string.
+
+The page id is hashed into the page's identity, so **both sides must use the same
+bytes, not merely the same-looking text**. `Å` as one code point and as `A` plus a
+combining ring are different identities, and PHP cannot normalise them because no
+build here carries `intl`. So `issue.php` and the generator both print a
+fingerprint of the identity:
+
+```
+page identity dc565b4f8e4e for 'DOC-Årsrapport-Übersicht'
+```
+
+Compare them if a key ever refuses its page — the decomposed spelling of that same
+id fingerprints as `30cd64970f7b`. Page ids that come from one source, a database
+column rather than two keyboards, cannot drift this way.
 
 Once unlocked, the page prints `Issued to <name> · <institution> · valid until
 <date>` into its header. The key id is never displayed, though it sits in the

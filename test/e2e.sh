@@ -47,7 +47,7 @@ try:
 except (OSError, KeyError, ValueError):
     print('keys/epochs.json is missing or unreadable', file=sys.stderr)
     sys.exit(1)
-missing = [e for e in ('E1', 'E2') if e not in epochs]
+missing = [e for e in ('E1', 'E2', 'E3') if e not in epochs]
 if missing:
     print('key table has no epoch ' + ', '.join(missing), file=sys.stderr)
     sys.exit(1)
@@ -63,12 +63,16 @@ TOKEN_UI=$(php php/issue.php --epoch E1 --page $PAGE --kid acct-4471 --exp 2027-
     --name 'A. Example' --institution 'Example Institute')
 TOKEN_BLANK=$(php php/issue.php --epoch E1 --page $PAGE --exp 9999-12-31 --name unknown --institution unknown)
 TOKEN_OTHERPAGE=$(php php/issue.php --epoch E1 --page $OTHER --kid wrong-page)
+UNIPAGE='DOC-Årsrapport-Übersicht'
+TOKEN_UNICODE=$(php php/issue.php --epoch E1 --page "$UNIPAGE" --kid 'nyckel-Åsa' \
+    --name 'Åsa Müller-Désirée' --institution 'Universität Göttingen' 2>/dev/null)
 EXP_PAST=$(local_moment 2020-03-01T00:00:00Z)
 EXP_FUTURE=$(local_moment 2099-12-31T00:00:00Z)
 EXP_UI=$(local_moment 2027-01-31T00:00:00Z)
 EXP_NEVER=$(local_moment 9999-12-31T00:00:00Z)
 TOKEN_E2=$(php php/issue.php --epoch E2 --page $PAGE --kid wrong-epoch)
 TOKEN_E2_OWN=$(php php/issue.php --epoch E2 --page $PAGE --kid e2-user)
+TOKEN_E3_OWN=$(php php/issue.php --epoch E3 --page $PAGE --kid e3-user)
 
 
 load_dotnet
@@ -193,6 +197,31 @@ open(p, 'w', encoding='utf-8').write(original.replace('</body>', driver + '</bod
 PYEOF
   "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
       --user-data-dir="$WORK/profile-$name" --virtual-time-budget=20000 \
+      --dump-dom "file://$page" 2>/dev/null \
+    | python3 -c "import sys,re; sys.stdout.write(re.sub(r'(?s)<script.*?</script>','',sys.stdin.read()))"
+}
+
+# Drives one token against a page that has already been generated.
+# $1 page file, $2 token, $3 profile tag, $4 "patched" to strip the epoch and page
+# checks so only the cryptography can refuse the key.
+drive_file() {
+  local src=$1 token=$2 tag=$3 mode=${4:-plain} page=$WORK/drive-$3.html
+  TOKEN_VALUE="$token" MODE="$mode" python3 - "$src" "$page" <<'PYEOF'
+import os, sys, json
+src, out = sys.argv[1], sys.argv[2]
+html = open(src, encoding='utf-8').read()
+if os.environ['MODE'] == 'patched':
+    # force the first C1 and skip the refusal, leaving AES-GCM as the only gate
+    html = html.replace("if (slot < 0) {", "if (slot < 0) { slot = 0; }\n    if (false) {", 1)
+    html = html.replace("if (payload.page !== d.page) {", "if (false) {", 1)
+driver = ("\n<script>\ndocument.querySelector('.reportseal-form textarea').value = %s;\n"
+          "document.querySelector('.reportseal-form')"
+          ".dispatchEvent(new Event('submit', {cancelable:true}));\n</script>\n"
+          ) % json.dumps(os.environ['TOKEN_VALUE'])
+open(out, 'w', encoding='utf-8').write(html.replace('</body>', driver + '</body>'))
+PYEOF
+  "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+      --user-data-dir="$WORK/profile-$tag" --virtual-time-budget=25000 \
       --dump-dom "file://$page" 2>/dev/null \
     | python3 -c "import sys,re; sys.stdout.write(re.sub(r'(?s)<script.*?</script>','',sys.stdin.read()))"
 }
@@ -360,9 +389,9 @@ TOKEN_VALUE="$TOKEN" python3 - "$OUT/page.html" "$PREFILL" <<'PYEOF'
 import os, sys, json
 src, out = sys.argv[1], sys.argv[2]
 html = open(src, encoding='utf-8').read()
-assert ' hidden data-epoch=' in html
-html = html.replace(' hidden data-epoch=',
-                    ' hidden data-debug-key="%s" data-epoch=' % os.environ['TOKEN_VALUE'], 1)
+assert ' hidden data-epochs=' in html
+html = html.replace(' hidden data-epochs=',
+                    ' hidden data-debug-key="%s" data-epochs=' % os.environ['TOKEN_VALUE'], 1)
 driver = ("\n<script>\nvar v = document.querySelector('.reportseal-form textarea').value;\n"
           "var p = document.createElement('p');\n"
           "p.textContent = 'PREFILL_LEN:' + v.length;\n"
@@ -375,6 +404,7 @@ DOM=$("$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usag
       --user-data-dir="$WORK/profile-prefill" --virtual-time-budget=20000 \
       --dump-dom "file://$PREFILL" 2>/dev/null \
     | python3 -c "import sys,re; sys.stdout.write(re.sub(r'(?s)<script.*?</script>','',sys.stdin.read()))")
+check "prefill probe ran"        "$DOM" "PREFILL_LEN:"  y
 check "entry box was pre-filled" "$DOM" "PREFILL_LEN:0" n
 check "and it opens the page"    "$DOM" "SEALED-SAMPLE-OK" y
 check "normal pages are not"     "$(cat "$OUT/page.html")" "data-debug-key" n
@@ -387,6 +417,50 @@ check "and that page declares no encoding" "$DOM" "data-encoding" n
 DOM=$(run_variant compressed E1 "" "$TOKEN")
 check "same token opens it compressed"  "$DOM" "SEALED-SAMPLE-OK"   y
 check "and that page declares gzip"     "$DOM" 'data-encoding="gzip"' y
+
+echo "== accented text survives the whole chain"
+UNIPAGEFILE=$WORK/unicode.html
+load_dotnet
+(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
+    --table "$ROOT/keys/epochs.json" --epoch E1 --page "$UNIPAGE" \
+    --hidden "$ROOT/samples/hidden.html" --header "$ROOT/samples/header.html" \
+    --title "Årsrapport" --out "$UNIPAGEFILE" >/dev/null 2>&1) \
+  || { echo "  FAIL could not generate the accented page"; fail=$((fail+1)); }
+load_chrome
+TOKEN_VALUE="$TOKEN_UNICODE" python3 - "$UNIPAGEFILE" <<'PYEOF'
+import os, sys, json
+p = sys.argv[1]
+original = open(p, encoding='utf-8').read()
+driver = ("\n<script>\ndocument.querySelector('.reportseal-form textarea').value = %s;\n"
+          "document.querySelector('.reportseal-form')"
+          ".dispatchEvent(new Event('submit', {cancelable:true}));\n</script>\n"
+          ) % json.dumps(os.environ['TOKEN_VALUE'])
+open(p, 'w', encoding='utf-8').write(original.replace('</body>', driver + '</body>'))
+PYEOF
+DOM=$("$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+      --user-data-dir="$WORK/profile-unicode" --virtual-time-budget=25000 \
+      --dump-dom "file://$UNIPAGEFILE" 2>/dev/null \
+    | python3 -c "import sys,re; sys.stdout.write(re.sub(r'(?s)<script.*?</script>','',sys.stdin.read()))")
+check "accented page id unlocks"  "$DOM" "SEALED-SAMPLE-OK"                y
+check "accented name in header"   "$DOM" "Åsa Müller-Désirée"              y
+check "accented institution"      "$DOM" "Universität Göttingen"           y
+
+# The two sides print a fingerprint of the identity so a page id that differs only
+# by Unicode composition is visible. They must agree, or the hint misleads.
+load_php
+PHP_FP=$(php php/issue.php --epoch E1 --page "$UNIPAGE" --kid fp-probe 2>&1 >/dev/null \
+         | grep -o 'page identity [0-9a-f]*' | awk '{print $3}')
+load_dotnet
+GEN_FP=$(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
+    --table "$ROOT/keys/epochs.json" --epoch E1 --page "$UNIPAGE" \
+    --hidden "$ROOT/samples/hidden.html" --title x --out "$WORK/fp.html" 2>/dev/null \
+  | grep -o 'identity [0-9a-f]*' | awk '{print $2}')
+if [ -n "$PHP_FP" ] && [ "$PHP_FP" = "$GEN_FP" ]; then
+  pass=$((pass+1)); echo "  ok   both sides fingerprint the identity alike ($PHP_FP)"
+else
+  fail=$((fail+1)); echo "  FAIL fingerprints differ: php=$PHP_FP generator=$GEN_FP"
+fi
+load_chrome
 
 echo "== tampered key is rejected"
 BAD=$(python3 - "$TOKEN" <<'PY'
@@ -401,11 +475,43 @@ DOM=$(run_case tampered "$BAD")
 check "signature refused" "$DOM" "signature is not valid" y
 check "content stays hidden" "$DOM" "SEALED-SAMPLE-OK"      n
 
+echo "== a page sealed under two epochs opens with a key from either"
+DOM=$(run_variant bothepochs "E1+E2" "" "$TOKEN")
+check "E1 key opens it"        "$DOM" "SEALED-SAMPLE-OK"          y
+check "page lists both epochs" "$DOM" 'data-epochs="E1+E2"'       y
+DOM=$(run_variant bothepochs2 "E1+E2" "" "$TOKEN_E2_OWN")
+check "E2 key opens it too"    "$DOM" "SEALED-SAMPLE-OK"          y
+DOM=$(run_variant bothepochs3 "E1+E2" "" "$TOKEN_OTHERPAGE")
+check "wrong page still refused" "$DOM" "SEALED-SAMPLE-OK"        n
+
 echo "== a page sealed under a different epoch opens with that epoch's key"
 DOM=$(run_variant epoch2 E2 "" "$TOKEN_E2_OWN")
 check "E2 page opens with E2 key" "$DOM" "SEALED-SAMPLE-OK" y
 DOM=$(run_variant epoch2b E2 "" "$TOKEN")
 check "E2 page refuses E1 key"   "$DOM" "SEALED-SAMPLE-OK" n
+
+echo "== a page sealed under E1+E3 refuses a valid E2 key"
+E1E3=$WORK/e1e3.html
+load_dotnet
+(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
+    --table "$ROOT/keys/epochs.json" --epoch E1+E3 --page $PAGE \
+    --hidden "$ROOT/samples/hidden.html" --header "$ROOT/samples/header.html" \
+    --title "Quarterly Summary" --out "$E1E3" >/dev/null 2>&1) \
+  || { echo "  FAIL could not seal under E1+E3"; fail=$((fail+1)); }
+load_chrome
+check "page lists only E1+E3" "$(cat "$E1E3")" 'data-epochs="E1+E3"' y
+# positive first, so the refusals below cannot pass just because the page is broken
+DOM=$(drive_file "$E1E3" "$TOKEN" e1e3-e1)
+check "E1 key opens it"       "$DOM" "SEALED-SAMPLE-OK" y
+DOM=$(drive_file "$E1E3" "$TOKEN_E3_OWN" e1e3-e3)
+check "E3 key opens it"       "$DOM" "SEALED-SAMPLE-OK" y
+DOM=$(drive_file "$E1E3" "$TOKEN_E2_OWN" e1e3-e2)
+check "valid E2 key refused"  "$DOM" "Key belongs to epoch 'E2'" y
+check "and content withheld"  "$DOM" "SEALED-SAMPLE-OK"          n
+# the refusal must not depend on the JavaScript check
+DOM=$(drive_file "$E1E3" "$TOKEN_E2_OWN" e1e3-patched patched)
+check "cryptography refuses E2 too" "$DOM" "did not authenticate" y
+check "still no content"            "$DOM" "SEALED-SAMPLE-OK"     n
 
 echo "== a key for another page is rejected"
 DOM=$(run_case wrongpage "$TOKEN_OTHERPAGE")

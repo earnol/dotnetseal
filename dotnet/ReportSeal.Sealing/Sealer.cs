@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Security.Cryptography;
@@ -139,22 +140,30 @@ namespace ReportSeal.Sealing
             Gt.FromBytes(Convert.FromBase64String(PairingConstantBase64));
 
         /// <param name="plaintext">The hidden fragment, as UTF-8 HTML.</param>
-        /// <param name="epoch">Epoch id, mixed into the key derivation and the AEAD tag.</param>
+        /// <param name="epochs">
+        /// The epochs this page may be opened under, at least one. A key issued for
+        /// any of them opens the page: the shared value is e(G1,G2)^k, which carries
+        /// no epoch, so one ephemeral scalar yields one content key and one
+        /// ciphertext no matter how many epochs are listed. Each epoch only needs its
+        /// own C1, costing one G2 multiply and about 128 characters in the page.
+        ///
+        /// Listing an old epoch alongside a new one deliberately keeps old keys
+        /// working for this page, which is what a transition window wants and the
+        /// opposite of what rotation is for.
+        /// </param>
         /// <param name="pageId">Assigned page id; the identity a key must match.</param>
-        /// <param name="masterPublicKey">The epoch's public half, 96 compressed bytes.</param>
         /// <param name="signX">Signature verification key X, base64url, from the key table.</param>
         /// <param name="signY">Signature verification key Y, base64url, from the key table.</param>
         /// <param name="options">Page behaviour; defaults to attribution shown, expiry not enforced.</param>
         public static SealedFragment Seal(
             byte[] plaintext,
-            string epoch,
+            EpochKey[] epochs,
             string pageId,
-            byte[] masterPublicKey,
             string signX,
             string signY,
             SealOptions options = null)
         {
-            return SealInternal(plaintext, epoch, pageId, masterPublicKey, signX, signY, options, null);
+            return SealInternal(plaintext, epochs, pageId, signX, signY, options, null);
         }
 
         /// <summary>
@@ -167,14 +176,13 @@ namespace ReportSeal.Sealing
         /// <inheritdoc cref="Seal" path="/param"/>
         public static SealOperation BeginSeal(
             byte[] plaintext,
-            string epoch,
+            EpochKey[] epochs,
             string pageId,
-            byte[] masterPublicKey,
             string signX,
             string signY,
             SealOptions options = null)
         {
-            return BeginSealInternal(plaintext, epoch, pageId, masterPublicKey, signX, signY, options, null);
+            return BeginSealInternal(plaintext, epochs, pageId, signX, signY, options, null);
         }
 
         /// <summary>
@@ -184,16 +192,15 @@ namespace ReportSeal.Sealing
         /// <inheritdoc cref="BeginSealInternal" path="/param"/>
         internal static SealedFragment SealInternal(
             byte[] plaintext,
-            string epoch,
+            EpochKey[] epochs,
             string pageId,
-            byte[] masterPublicKey,
             string signX,
             string signY,
             SealOptions options,
             string debugToken)
         {
             var operation = BeginSealInternal(
-                plaintext, epoch, pageId, masterPublicKey, signX, signY, options, debugToken);
+                plaintext, epochs, pageId, signX, signY, options, debugToken);
             while (operation.MoveNext())
             {
                 // every step runs back to back; callers that care about latency
@@ -207,9 +214,18 @@ namespace ReportSeal.Sealing
         /// argument for demos.
         /// </summary>
         /// <param name="plaintext">The hidden fragment, as UTF-8 HTML.</param>
-        /// <param name="epoch">Epoch id, mixed into the key derivation and the AEAD tag.</param>
+        /// <param name="epochs">
+        /// The epochs this page may be opened under, at least one. A key issued for
+        /// any of them opens the page: the shared value is e(G1,G2)^k, which carries
+        /// no epoch, so one ephemeral scalar yields one content key and one
+        /// ciphertext no matter how many epochs are listed. Each epoch only needs its
+        /// own C1, costing one G2 multiply and about 128 characters in the page.
+        ///
+        /// Listing an old epoch alongside a new one deliberately keeps old keys
+        /// working for this page, which is what a transition window wants and the
+        /// opposite of what rotation is for.
+        /// </param>
         /// <param name="pageId">Assigned page id; the identity a key must match.</param>
-        /// <param name="masterPublicKey">The epoch's public half, 96 compressed bytes.</param>
         /// <param name="signX">Signature verification key X, base64url, from the key table.</param>
         /// <param name="signY">Signature verification key Y, base64url, from the key table.</param>
         /// <param name="options">Page behaviour; defaults to attribution shown, expiry not enforced.</param>
@@ -226,25 +242,47 @@ namespace ReportSeal.Sealing
         /// </param>
         internal static SealOperation BeginSealInternal(
             byte[] plaintext,
-            string epoch,
+            EpochKey[] epochs,
             string pageId,
-            byte[] masterPublicKey,
             string signX,
             string signY,
             SealOptions options,
             string debugToken)
         {
             if (plaintext == null) throw new ArgumentNullException(nameof(plaintext));
-            if (masterPublicKey == null) throw new ArgumentNullException(nameof(masterPublicKey));
-            if (string.IsNullOrEmpty(epoch)) throw new ArgumentException("epoch is required", nameof(epoch));
+            if (epochs == null) throw new ArgumentNullException(nameof(epochs));
+            if (epochs.Length == 0)
+            {
+                throw new ArgumentException("at least one epoch is required", nameof(epochs));
+            }
+            foreach (var candidate in epochs)
+            {
+                if (candidate == null)
+                {
+                    throw new ArgumentException("epoch entries may not be null", nameof(epochs));
+                }
+            }
+            for (var i = 0; i < epochs.Length; i++)
+            {
+                for (var j = i + 1; j < epochs.Length; j++)
+                {
+                    if (string.Equals(epochs[i].Id, epochs[j].Id, StringComparison.Ordinal))
+                    {
+                        throw new ArgumentException(
+                            "epoch '" + epochs[i].Id + "' is listed twice", nameof(epochs));
+                    }
+                }
+            }
             if (string.IsNullOrEmpty(pageId)) throw new ArgumentException("page id is required", nameof(pageId));
+            if (!IsValidPageId(pageId))
+            {
+                throw new ArgumentException(
+                    "page id may use letters, digits and _.:- only, up to 64 characters",
+                    nameof(pageId));
+            }
             if (string.IsNullOrEmpty(signX) || string.IsNullOrEmpty(signY))
             {
                 throw new ArgumentException("signature verification key is required");
-            }
-            if (masterPublicKey.Length != 96)
-            {
-                throw new ArgumentException("master public key must be 96 compressed bytes", nameof(masterPublicKey));
             }
             if (debugToken != null && !IsWellFormedToken(debugToken))
             {
@@ -254,9 +292,62 @@ namespace ReportSeal.Sealing
                     "debug token must look like NO1.<base64url>.<base64url>", nameof(debugToken));
             }
 
+            // Sorted so the derivation string depends on the set, not on the order
+            // the caller happened to pass. A single epoch yields just its own name,
+            // which is byte-identical to how one-epoch pages derived before.
+            var ordered = (EpochKey[])epochs.Clone();
+            Array.Sort(ordered, (a, b) => string.CompareOrdinal(a.Id, b.Id));
+
             return new SealOperation(
-                plaintext, epoch, pageId, masterPublicKey, signX, signY,
+                plaintext, ordered, pageId, signX, signY,
                 options ?? new SealOptions(), debugToken);
+        }
+
+        /// <summary>
+        /// The same rule php/issue.php applies, so a page cannot be sealed under an
+        /// id no key could ever be issued for. Letters, digits and combining marks
+        /// in any script, plus _ . : and -. Everything else is out, in particular
+        /// whitespace and the '|' and '+' that separate fields in the derivation
+        /// string. Counted in code points, so an accented id is not penalised for
+        /// the bytes it takes.
+        /// </summary>
+        private static bool IsValidPageId(string pageId)
+        {
+            var points = 0;
+            for (var i = 0; i < pageId.Length; i++)
+            {
+                var category = CharUnicodeInfo.GetUnicodeCategory(pageId, i);
+                var c = pageId[i];
+                var allowed = c == '_' || c == '.' || c == ':' || c == '-';
+
+                switch (category)
+                {
+                    case UnicodeCategory.UppercaseLetter:
+                    case UnicodeCategory.LowercaseLetter:
+                    case UnicodeCategory.TitlecaseLetter:
+                    case UnicodeCategory.ModifierLetter:
+                    case UnicodeCategory.OtherLetter:
+                    case UnicodeCategory.DecimalDigitNumber:
+                    case UnicodeCategory.LetterNumber:
+                    case UnicodeCategory.OtherNumber:
+                    case UnicodeCategory.NonSpacingMark:
+                    case UnicodeCategory.SpacingCombiningMark:
+                    case UnicodeCategory.EnclosingMark:
+                        allowed = true;
+                        break;
+                }
+
+                if (!allowed) { return false; }
+
+                if (char.IsHighSurrogate(c) && i + 1 < pageId.Length
+                    && char.IsLowSurrogate(pageId[i + 1]))
+                {
+                    i++;      // one code point, two UTF-16 units
+                }
+                points++;
+                if (points > 64) { return false; }
+            }
+            return points > 0;
         }
 
         /// <summary>Shape check only; the browser is what actually verifies a token.</summary>
@@ -294,6 +385,14 @@ namespace ReportSeal.Sealing
         public static Gt SharedValueForTest(Scalar ephemeral)
         {
             return SharedValue(ephemeral);
+        }
+
+        /// <summary>The set's name for derivation: ids sorted and joined with '+'.</summary>
+        internal static string JoinIds(EpochKey[] ordered)
+        {
+            var names = new string[ordered.Length];
+            for (var i = 0; i < ordered.Length; i++) { names[i] = ordered[i].Id; }
+            return string.Join("+", names);
         }
 
         internal static byte[] SealBody(
@@ -342,11 +441,11 @@ namespace ReportSeal.Sealing
         }
 
         internal static string Markup(
-            string elementId, string epoch, string pageId, byte[] iv, byte[] ciphertext,
-            byte[] c1, string signX, string signY, SealOptions options, string debugToken)
+            string elementId, string epochs, string pageId, byte[] iv, byte[] ciphertext,
+            string c1List, string signX, string signY, SealOptions options, string debugToken)
         {
             return BuildMarkup(
-                elementId, epoch, pageId, iv, ciphertext, c1, signX, signY, options, debugToken);
+                elementId, epochs, pageId, iv, ciphertext, c1List, signX, signY, options, debugToken);
         }
 
         internal static string NewElementId()
@@ -442,11 +541,11 @@ namespace ReportSeal.Sealing
         /// </summary>
         private static string BuildMarkup(
             string elementId,
-            string epoch,
+            string epochs,
             string pageId,
             byte[] iv,
             byte[] ciphertext,
-            byte[] c1,
+            string c1List,
             string signX,
             string signY,
             SealOptions options,
@@ -455,9 +554,9 @@ namespace ReportSeal.Sealing
             var sb = new StringBuilder();
             sb.Append("<div id=\"").Append(elementId).Append('"')
               .Append(" hidden")
-              .Append(" data-epoch=\"").Append(TextEscape.Html(epoch)).Append('"')
+              .Append(" data-epochs=\"").Append(TextEscape.Html(epochs)).Append('"')
               .Append(" data-page=\"").Append(TextEscape.Html(pageId)).Append('"')
-              .Append(" data-c1=\"").Append(Base64Url.Encode(c1)).Append('"')
+              .Append(" data-c1=\"").Append(c1List).Append('"')
               .Append(" data-iv=\"").Append(Base64Url.Encode(iv)).Append('"')
               .Append(" data-sign-x=\"").Append(TextEscape.Html(signX)).Append('"')
               .Append(" data-sign-y=\"").Append(TextEscape.Html(signY)).Append('"');

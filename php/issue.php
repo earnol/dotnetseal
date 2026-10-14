@@ -63,6 +63,8 @@ try {
         $epoch = end($epochs);
     }
     echo mint_token($epoch, $pageId, $opts), "\n";
+    // on stderr so stdout stays exactly the token
+    fwrite(STDERR, 'page identity ' . page_fingerprint($pageId) . " for '$pageId'\n");
 } catch (RuntimeException $e) {
     fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
     exit(1);
