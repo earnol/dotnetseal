@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Custom Layout</title>
+<style>
+  /* Because this page styles the unlock classes itself, the generator leaves its
+     own defaults out entirely. All or nothing: the page owns the look. */
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 42rem; padding: 2rem 1rem; }
+  .reportseal-status { font-size: .9rem; color: #555; }
+  .reportseal-status.err { color: #b00; }
+  .reportseal-status.ok { color: #060; }
+  .reportseal-locked, .reportseal-remembered, .reportseal-expiry { font-size: .9rem; color: #666; }
+  .panel { border: 1px solid #ccc; padding: 1rem; border-radius: .4rem; }
+  .receipt { background: #f6f6f6; padding: .75rem; font-size: .9rem; }
+</style>
+</head>
+<body>
+
+<h1>Custom Layout</h1>
+
+<p>This page supplies its own entry control, its own status line and its own
+attribution wording, so the script fills them in rather than building furniture of
+its own.</p>
+
+<p class="receipt" data-reportseal-attribution="DOC-1234">
+  Prepared for <strong>$$reportseal-name$$</strong> of <em>$$reportseal-institution$$</em>.
+  Valid until $$reportseal-exp$$. Tier: $$reportseal-extra:tier$$.
+</p>
+
+<div class="panel">
+  <label for="mykey">Paste your key</label>
+  <textarea id="mykey" data-reportseal-key="DOC-1234" rows="2" style="width:100%"></textarea>
+  <button type="button" data-reportseal-unlock="DOC-1234">Open the report</button>
+  <p data-reportseal-status="DOC-1234" class="reportseal-status"></p>
+</div>
+
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<h2>Sealed section</h2>
+<p>SEALED-CUSTOM-OK — this content was decrypted in the browser and inserted where
+its marker stood.</p>
+<!-- EndOfReportSeal -->
+
+</body>
+</html>

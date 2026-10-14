@@ -212,6 +212,20 @@ function page_identity(string $pageId): string
     return Bls12381::scalarFromBytes(hash('sha256', 'reportseal/v2|' . $pageId, true));
 }
 
+/**
+ * Short fingerprint of the exact bytes a page id hashes to.
+ *
+ * There is no intl extension here, so this side cannot normalise Unicode. Two page
+ * ids that look identical but differ in composition — "Å" as one code point or as
+ * A plus a combining ring — hash to different identities, and the only symptom
+ * would be a key that refuses to open its page. Both the issuer and the generator
+ * print this, so a mismatch is obvious before anyone goes hunting.
+ */
+function page_fingerprint(string $pageId): string
+{
+    return substr(hash('sha256', 'reportseal/v2|' . $pageId), 0, 12);
+}
+
 function master_path(string $epoch): string
 {
     return keys_dir() . '/private/master-' . $epoch . '.key';
@@ -287,19 +301,23 @@ function mint_token(string $epoch, string $pageId, array $opts = []): string
     if ($unknown !== []) {
         throw new RuntimeException('unknown option(s): ' . implode(', ', $unknown));
     }
+    // Deliberately ASCII: this names a file in keys/private/ and is joined with
+    // '+' into the derivation string.
     if (!preg_match('/^[A-Za-z0-9_.-]{1,32}$/', $epoch)) {
         throw new RuntimeException('invalid epoch id (allowed: A-Za-z0-9_.- up to 32 chars)');
     }
-    if (!preg_match('/^[A-Za-z0-9_.:-]{1,64}$/', $pageId)) {
-        throw new RuntimeException('invalid page id (allowed: A-Za-z0-9_.:- up to 64 chars)');
+    if (!preg_match('/^[\p{L}\p{N}\p{M}_.:-]+$/u', $pageId) || mb_strlen($pageId) > 64) {
+        throw new RuntimeException(
+            'invalid page id (allowed: letters, digits and _.:- up to 64 characters)');
     }
 
     $kid = (string) ($opts['kid'] ?? '');
     if ($kid === '') {
         $kid = random_kid();
     }
-    if (!preg_match('/^[A-Za-z0-9_.:-]{1,40}$/', $kid)) {
-        throw new RuntimeException('invalid key id (allowed: A-Za-z0-9_.:- up to 40 chars)');
+    if (!preg_match('/^[\p{L}\p{N}\p{M}_.:-]+$/u', $kid) || mb_strlen($kid) > 40) {
+        throw new RuntimeException(
+            'invalid key id (allowed: letters, digits and _.:- up to 40 characters)');
     }
 
     // Descriptive fields first, then any caller extras, so the well-known keys
@@ -325,7 +343,12 @@ function mint_token(string $epoch, string $pageId, array $opts = []): string
         'extra' => $extra,
     ];
 
-    $p64 = b64u(json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
+    // UTF-8 rather than \uXXXX escapes: an accented letter then costs its 2 UTF-8
+    // bytes instead of 6 characters, and the browser parses either form.
+    $p64 = b64u(json_encode(
+        $payload,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+    ));
     $sig = b64u(ecdsa_sign_raw($p64, (string) file_get_contents(private_path('signprivate'))));
 
     return "NO1.$p64.$sig";

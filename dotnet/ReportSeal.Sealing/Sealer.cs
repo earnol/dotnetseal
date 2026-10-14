@@ -73,6 +73,14 @@ namespace ReportSeal.Sealing
         /// the epoch is the only real withdrawal.
         /// </summary>
         public bool EnforceExpiry { get; set; }
+
+        /// <summary>
+        /// The AES-GCM implementation to encrypt with. Null means
+        /// <see cref="PlatformAesGcm"/>, the runtime's own. Supply another where the
+        /// runtime lacks AES-GCM; an asynchronous one must be driven through
+        /// <see cref="Sealer.BeginSeal"/>.
+        /// </summary>
+        public IAesGcm Cipher { get; set; }
     }
 
     /// <summary>
@@ -203,8 +211,16 @@ namespace ReportSeal.Sealing
                 plaintext, epochs, pageId, signX, signY, options, debugToken);
             while (operation.MoveNext())
             {
-                // every step runs back to back; callers that care about latency
-                // drive the operation themselves and yield between steps
+                // Every step runs back to back. An asynchronous cipher cannot be waited
+                // for here: on a single-threaded host its result arrives only once this
+                // call returns, so spinning would never end.
+                if (operation.IsWaitingOnCipher)
+                {
+                    throw new InvalidOperationException(
+                        "the configured AES-GCM implementation completes asynchronously, which " +
+                        "a synchronous Seal cannot wait for; drive Sealer.BeginSeal from a " +
+                        "coroutine instead");
+                }
             }
             return operation.Result;
         }
@@ -395,32 +411,69 @@ namespace ReportSeal.Sealing
             return string.Join("+", names);
         }
 
-        internal static byte[] SealBody(
-            byte[] plaintext, string epoch, string pageId, Gt shared, bool compress, out byte[] iv)
+        /// <summary>An encryption in flight: what was handed to the cipher, and its job.</summary>
+        internal sealed class BodyJob
+        {
+            public byte[] Iv;
+            public byte[] Key;
+            public int ExpectedLength;
+            public AesGcmJob Job;
+        }
+
+        /// <summary>
+        /// Derives the content key and hands the body to the cipher. The cipher may
+        /// finish now or later; <see cref="FinishBody"/> collects the result.
+        /// </summary>
+        internal static BodyJob BeginBody(
+            byte[] plaintext, string epochs, string pageId, Gt shared, bool compress, IAesGcm cipher)
         {
             // Compression sits inside the AEAD, so the ciphertext is what gets
             // authenticated either way and the key derivation is untouched.
             var body = compress ? Gzip(plaintext) : plaintext;
 
-            var info = Encoding.UTF8.GetBytes("reportseal/v2|" + epoch + "|" + pageId);
-            var aad = Encoding.UTF8.GetBytes(epoch + "|" + pageId);
+            var info = Encoding.UTF8.GetBytes("reportseal/v2|" + epochs + "|" + pageId);
+            var aad = Encoding.UTF8.GetBytes(epochs + "|" + pageId);
             var key = DeriveKey(Canonicalise(shared), info);
 
-            iv = new byte[12];
+            var iv = new byte[12];
             RandomNumberGenerator.Fill(iv);
 
-            var output = new byte[body.Length + 16];
-            using (var gcm = new AesGcm(key))
+            return new BodyJob
             {
-                gcm.Encrypt(
-                    iv,
-                    body,
-                    new Span<byte>(output, 0, body.Length),
-                    new Span<byte>(output, body.Length, 16),
-                    aad);
+                Iv = iv,
+                Key = key,
+                ExpectedLength = body.Length + 16,
+                Job = cipher.Encrypt(key, iv, body, aad),
+            };
+        }
+
+        /// <summary>
+        /// Collects a finished encryption and clears the key. The length check catches
+        /// a cipher that dropped the tag or truncated its output, which would otherwise
+        /// surface only as a page that refuses every key.
+        /// </summary>
+        internal static byte[] FinishBody(BodyJob pending)
+        {
+            try
+            {
+                if (pending.Job.Error != null)
+                {
+                    throw new CryptographicException(
+                        "the AES-GCM implementation failed: " + pending.Job.Error.Message, pending.Job.Error);
+                }
+                var output = pending.Job.CiphertextAndTag;
+                if (output == null || output.Length != pending.ExpectedLength)
+                {
+                    throw new CryptographicException(
+                        "the AES-GCM implementation returned " + (output == null ? "nothing" : output.Length + " bytes") +
+                        " where " + pending.ExpectedLength + " were expected (ciphertext plus a 16-byte tag)");
+                }
+                return output;
             }
-            CryptographicOperations.ZeroMemory(key);
-            return output;
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pending.Key);
+            }
         }
 
         /// <summary>
@@ -554,6 +607,8 @@ namespace ReportSeal.Sealing
             var sb = new StringBuilder();
             sb.Append("<div id=\"").Append(elementId).Append('"')
               .Append(" hidden")
+              // how the shared script finds every sealed fragment on the page
+              .Append(" data-reportseal")
               .Append(" data-epochs=\"").Append(TextEscape.Html(epochs)).Append('"')
               .Append(" data-page=\"").Append(TextEscape.Html(pageId)).Append('"')
               .Append(" data-c1=\"").Append(c1List).Append('"')

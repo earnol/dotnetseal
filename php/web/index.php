@@ -97,6 +97,7 @@ if ($posted) {
             'Key id'      => $kid,
             'Epoch'       => $in['epoch'],
             'Page id'     => $in['page_id'],
+            'Page identity' => page_fingerprint($in['page_id']),
             'User'        => $name,
             'Institution' => $institution,
             'Expires'     => normalise_exp($exp),
@@ -188,9 +189,10 @@ anyone who can load it can mint keys.</p>
   </label>
 
   <label>Page id
-    <span>The page this key opens. Must match the id the page was generated with.</span>
+    <span>The page this key opens. Must match the id the page was generated with,
+    character for character.</span>
     <input name="page_id" value="<?= h($in['page_id']) ?>" autocomplete="off" required
-           pattern="[A-Za-z0-9_.:\-]{1,64}">
+           maxlength="64">
   </label>
 
   <label>User name
@@ -218,8 +220,7 @@ anyone who can load it can mint keys.</p>
 
   <label>Key id
     <span>For your logs. Not shown on the page. Blank generates a random one.</span>
-    <input name="kid" value="<?= h($in['kid']) ?>" autocomplete="off"
-           pattern="[A-Za-z0-9_.:\-]{1,40}">
+    <input name="kid" value="<?= h($in['kid']) ?>" autocomplete="off" maxlength="40">
   </label>
 
   <button type="submit">Issue key</button>

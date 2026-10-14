@@ -171,6 +171,52 @@ internal static class Program
             }
         }
 
+        Console.WriteLine("== the AES-GCM seam");
+        // An asynchronous cipher: answers only after a few polls, as a browser call would.
+        var slow = new DelayedCipher(3);
+        var waiting = Sealer.BeginSeal(body, e1, "DOC-1", SignX, SignY, new SealOptions { Cipher = slow });
+        var calls = 0;
+        var sawWaiting = false;
+        while (waiting.MoveNext())
+        {
+            calls++;
+            if (waiting.IsWaitingOnCipher) { sawWaiting = true; slow.Poll(); }
+        }
+        Check("yields while the cipher works", sawWaiting);
+        Check("takes extra calls, not extra steps", calls > waiting.StepCount - 1);
+        Check("finishes with a result", waiting.Result != null);
+        Check("same output shape as the platform cipher",
+            waiting.Result.Markup.Length == Sealer.Seal(body, e1, "DOC-1", SignX, SignY).Markup.Length);
+        Check("the cipher received the associated data", slow.LastAad == "E1|DOC-1");
+        Check("and a 32-byte key", slow.LastKeyLength == 32);
+        Check("and a 12-byte nonce", slow.LastNonceLength == 12);
+        Check("the key is cleared once collected", slow.KeyWasClearedAfter);
+
+        try
+        {
+            Sealer.Seal(body, e1, "DOC-1", SignX, SignY, new SealOptions { Cipher = new DelayedCipher(3) });
+            Check("synchronous Seal refuses an asynchronous cipher", false);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Check("synchronous Seal refuses an asynchronous cipher", ex.Message.Contains("BeginSeal"));
+        }
+
+        foreach (var (label, bad) in new (string, IAesGcm)[] {
+            ("a failing cipher", new FailingCipher()),
+            ("a cipher that drops the tag", new TruncatingCipher()) })
+        {
+            try
+            {
+                Sealer.Seal(body, e1, "DOC-1", SignX, SignY, new SealOptions { Cipher = bad });
+                Check(label + " is reported", false);
+            }
+            catch (System.Security.Cryptography.CryptographicException)
+            {
+                Check(label + " is reported", true);
+            }
+        }
+
         Console.WriteLine("== concurrent sealing from many threads");
         // A GUI host may seal on a worker while another is in flight. Nothing here
         // has thread affinity, and this is what proves it.
@@ -224,6 +270,64 @@ internal static class Program
         if (value.Length == 0) { return "(empty)"; }
         if (value.Length > 20) { return value.Substring(0, 8) + "... (" + value.Length + ")"; }
         return "'" + value.Replace("\t", "\\t").Replace("\n", "\\n").Replace("\0", "\\0") + "'";
+    }
+
+    /// <summary>Wraps the platform cipher but answers only after a given number of polls.</summary>
+    private sealed class DelayedCipher : IAesGcm
+    {
+        private readonly int delay;
+        private AesGcmJob job;
+        private AesGcmJob inner;
+        private byte[] key;
+        private int polls;
+
+        public DelayedCipher(int delay) { this.delay = delay; }
+
+        public string LastAad { get; private set; }
+        public int LastKeyLength { get; private set; }
+        public int LastNonceLength { get; private set; }
+
+        public bool KeyWasClearedAfter => key != null && Array.TrueForAll(key, b => b == 0);
+
+        public AesGcmJob Encrypt(byte[] key, byte[] nonce, byte[] plaintext, byte[] associatedData)
+        {
+            LastAad = Encoding.UTF8.GetString(associatedData);
+            LastKeyLength = key.Length;
+            LastNonceLength = nonce.Length;
+            this.key = key;        // the sealer's own array, so clearing it is observable
+            inner = PlatformAesGcm.Instance.Encrypt(key, nonce, plaintext, associatedData);
+            job = new AesGcmJob();
+            return job;
+        }
+
+        public void Poll()
+        {
+            if (job != null && !job.IsComplete && ++polls >= delay)
+            {
+                job.Complete(inner.CiphertextAndTag);
+            }
+        }
+    }
+
+    private sealed class FailingCipher : IAesGcm
+    {
+        public AesGcmJob Encrypt(byte[] key, byte[] nonce, byte[] plaintext, byte[] associatedData)
+        {
+            var job = new AesGcmJob();
+            job.Fail(new InvalidOperationException("simulated failure"));
+            return job;
+        }
+    }
+
+    private sealed class TruncatingCipher : IAesGcm
+    {
+        public AesGcmJob Encrypt(byte[] key, byte[] nonce, byte[] plaintext, byte[] associatedData)
+        {
+            var full = PlatformAesGcm.Instance.Encrypt(key, nonce, plaintext, associatedData).CiphertextAndTag;
+            var cut = new byte[full.Length - 16];
+            Array.Copy(full, cut, cut.Length);
+            return AesGcmJob.Completed(cut);
+        }
     }
 
     private static void Check(string name, bool ok)

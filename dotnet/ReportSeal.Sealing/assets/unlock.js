@@ -1,156 +1,59 @@
 (function () {
   "use strict";
 
-  var box = document.getElementById("__ID__");
-  if (!box) { return; }
+  var sealed = document.querySelectorAll("[data-reportseal]");
+  if (!sealed.length) { return; }
 
-  var d = box.dataset;
-  var ct = (box.textContent || "").replace(/\s+/g, "");
-  var showAttribution = !("noAttribution" in d);
-  var enforceExpiry = "enforceExpiry" in d;
   var enc = new TextEncoder();
+  var dec = new TextDecoder();
 
-  var ui = document.createElement("div");
-  ui.innerHTML =
-    '<form class="reportseal-form" autocomplete="off">' +
-      '<label for="key-__ID__">Decryption key</label>' +
-      '<textarea id="key-__ID__" spellcheck="false" ' +
-        'placeholder="Paste a key (NO1.…) — any valid key opens this page"></textarea>' +
-      '<button type="submit">Unlock</button>' +
-      '<p class="reportseal-status" role="status" aria-live="polite"></p>' +
-    '</form>' +
-    '<p class="reportseal-locked">The remainder of this page is encrypted.</p>' +
-    '<p class="reportseal-remembered" hidden>This key is remembered on this device. ' +
-      '<button type="button" class="reportseal-forget">Forget key</button></p>' +
-    '<p class="reportseal-expiry" role="note" hidden></p>' +
-    '<section class="reportseal-content" hidden></section>' +
-    '<section class="reportseal-keydata" hidden><h2>Key data</h2><dl></dl></section>';
-  box.parentNode.insertBefore(ui, box.nextSibling);
-
-  var form = ui.querySelector(".reportseal-form");
-  var input = ui.querySelector("textarea");
-  var statusEl = ui.querySelector(".reportseal-status");
-
-  // A demo page may ship with a key already in the box. It still has to pass every
-  // check a typed key does; this only saves the paste.
-  if (d.debugKey) { input.value = d.debugKey; }
-
-  // Remembering the key. Scoped to this page id so two documents opened from the
-  // same machine never pick up each other's key. Every access is guarded: storage
-  // can be absent or throw outright, and that must never stop a manual unlock.
-  var storeKey = "reportseal/v2/" + d.epochs + "/" + d.page;
-
-  function recall() {
-    try { return window.localStorage.getItem(storeKey); } catch (e) { return null; }
+  // Fragments are grouped by the epoch set and page id they were sealed under, so
+  // one key entry serves every fragment it can actually open. A page whose
+  // fragments all share a page id therefore shows a single box.
+  var groups = [];
+  var byKey = {};
+  for (var i = 0; i < sealed.length; i++) {
+    var el = sealed[i];
+    var id = el.dataset.epochs + "|" + el.dataset.page;
+    if (!byKey[id]) {
+      byKey[id] = { epochs: el.dataset.epochs, page: el.dataset.page, items: [], ui: null };
+      groups.push(byKey[id]);
+    }
+    byKey[id].items.push(el);
   }
 
-  function remember(token) {
-    try { window.localStorage.setItem(storeKey, token); return true; } catch (e) { return false; }
+  // A page may supply its own controls instead of letting the script build them.
+  // A hook is claimed by the group whose page id it names; an unnamed hook belongs
+  // to whichever group asks first, which is unambiguous on a single-group page.
+  function claim(name, group) {
+    var all = document.querySelectorAll("[data-reportseal-" + name + "]");
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].reportsealClaimed) { continue; }
+      var want = (all[i].getAttribute("data-reportseal-" + name) || "").trim();
+      if (want === "" || want === group.page) {
+        all[i].reportsealClaimed = true;
+        return all[i];
+      }
+    }
+    return null;
   }
 
-  function forget() {
-    try { window.localStorage.removeItem(storeKey); } catch (e) { /* nothing to do */ }
+  function claimAll(name, group) {
+    var found = [], one;
+    while ((one = claim(name, group)) !== null) { found.push(one); }
+    return found;
   }
 
   function hasWebCrypto() {
     return !!(window.crypto && window.crypto.subtle);
   }
 
-  function say(msg, cls) {
-    statusEl.textContent = msg;
-    statusEl.className = "reportseal-status" + (cls ? " " + cls : "");
-  }
-
   function b64uToBytes(s) {
     s = String(s).replace(/-/g, "+").replace(/_/g, "/");
     while (s.length % 4) { s += "="; }
     var bin = atob(s), out = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+    for (var j = 0; j < bin.length; j++) { out[j] = bin.charCodeAt(j); }
     return out;
-  }
-
-  // Any key issued for this page opens it; a key for another page cannot.
-  // Returns { html, payload }.
-  async function unlock(token) {
-    var m = /^NO1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(token.trim());
-    if (!m) { throw new Error("That does not look like a key (expected NO1.\u2026.\u2026)."); }
-    var p64 = m[1], s64 = m[2];
-
-    // 1. The signature is the only hard gate: it proves the key server issued
-    //    this key and that nobody edited its data block.
-    var verifyKey = await crypto.subtle.importKey(
-      "jwk", { kty: "EC", crv: "P-256", x: d.signX, y: d.signY },
-      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-    var sigOk = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" }, verifyKey, b64uToBytes(s64), enc.encode(p64));
-    if (!sigOk) { throw new Error("Key rejected: signature is not valid."); }
-
-    var payload = JSON.parse(new TextDecoder().decode(b64uToBytes(p64)));
-    if (payload.v !== 2) {
-      throw new Error("Key format v" + payload.v + " is not one this page understands.");
-    }
-    // A page may be sealed under several epochs; a key from any of them opens it.
-    // The epoch list and the C1 list are in the same order, so the token's epoch
-    // picks which C1 to pair with its element.
-    var epochs = String(d.epochs).split("+");
-    var slot = epochs.indexOf(payload.epoch);
-    if (slot < 0) {
-      throw new Error("Key belongs to epoch '" + payload.epoch +
-                      "'; this page was sealed under '" + epochs.join("', '") + "'.");
-    }
-    if (payload.page !== d.page) {
-      throw new Error("Key was issued for page '" + payload.page +
-                      "'; this page is '" + d.page + "'.");
-    }
-
-    // 2. Optionally refuse a key that is past its date. This happens before any
-    //    decryption, but it is a courtesy rather than a control: the holder's
-    //    element still works, so anyone determined can decrypt without this page.
-    if (enforceExpiry && payload.extra && payload.extra.exp) {
-      var until = new Date(payload.extra.exp);
-      if (!isNaN(until.getTime()) && until.getTime() < Date.now()) {
-        var refusal = new Error("This key expired on " + fmt(until) +
-                                ", and this page is set to refuse expired keys.");
-        refusal.expired = true;
-        throw refusal;
-      }
-    }
-
-    // 3. One pairing recovers the shared value. The key carries this page's
-    //    private element, the page carries the generator's ephemeral point, and
-    //    e(sk, C1) = e(G1, G2)^k, the value the generator sealed with. An element
-    //    issued for another page gives a different result, so the binding is
-    //    cryptographic rather than a check that could be patched out.
-    var B = window.bls12_381;
-    if (!B) { throw new Error("The curve library did not load, so this page cannot be decrypted."); }
-    var sk, c1;
-    try {
-      sk = B.G1.Point.fromBytes(b64uToBytes(payload.sk));
-      c1 = B.G2.Point.fromBytes(b64uToBytes(String(d.c1).split("+")[slot]));
-    } catch (e) {
-      throw new Error("Key rejected: its page element is malformed.");
-    }
-    var shared = B.fields.Fp12.toBytes(B.pairing(sk, c1));
-
-    // 4. HKDF binds the content key to this epoch and page.
-    var ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
-    var kBits = await crypto.subtle.deriveBits({
-      name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0),
-      info: enc.encode("reportseal/v2|" + d.epochs + "|" + d.page)
-    }, ikm, 256);
-    var key = await crypto.subtle.importKey("raw", kBits, "AES-GCM", false, ["decrypt"]);
-
-    var plain = await crypto.subtle.decrypt({
-      name: "AES-GCM", iv: b64uToBytes(d.iv), tagLength: 128,
-      additionalData: enc.encode(d.epochs + "|" + d.page)
-    }, key, b64uToBytes(ct));
-
-    // 5. The fragment may have been compressed before it was encrypted. That is a
-    //    property of the page, not of the key: the same key opens either kind.
-    var bytes = new Uint8Array(plain);
-    if (d.encoding === "gzip") { bytes = await inflate(bytes); }
-
-    return { html: new TextDecoder().decode(bytes), payload: payload, token: token.trim() };
   }
 
   async function inflate(bytes) {
@@ -160,27 +63,6 @@
     }
     var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
     return new Uint8Array(await new Response(stream).arrayBuffer());
-  }
-
-  // Expiry is a signed notice, never a gate: the content has already been
-  // decrypted by the time this runs. The banner only appears when something is
-  // wrong with the date; the header line carries the normal case. Real withdrawal
-  // is done by rotating the epoch keypair, which no issued key can follow.
-  function reportExpiry(exp) {
-    if (!exp) { return; }
-    var el = ui.querySelector(".reportseal-expiry");
-    var when = new Date(exp);
-    if (isNaN(when.getTime())) {
-      el.textContent = "This key carries an expiry value this page cannot read (" +
-                       exp + "). The content below was decrypted anyway.";
-    } else if (when.getTime() < Date.now()) {
-      el.textContent = "This key expired on " + fmt(when) +
-                       ". The content below was still decrypted — expiry is a notice only.";
-    } else {
-      return;
-    }
-    el.className = "reportseal-expiry expired";
-    el.hidden = false;
   }
 
   // Expiry moments are shown in the reader's own time zone, to minutes. The token
@@ -195,117 +77,393 @@
     try {
       var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
         .formatToParts(new Date());
-      for (var i = 0; i < parts.length; i++) {
-        if (parts[i].type === "timeZoneName") { return parts[i].value; }
+      for (var k = 0; k < parts.length; k++) {
+        if (parts[k].type === "timeZoneName") { return parts[k].value; }
       }
     } catch (e) { /* fall through */ }
     return "local time";
   }
 
-  // Who the key was issued to, written into the host page's header if it offers a
-  // [data-reportseal-attribution] element, otherwise shown above the content. The
-  // key id and document id are deliberately left out.
-  function attribute(meta) {
+  // ---------------------------------------------------------------- per group UI
+
+  function buildUi(group, index) {
+    group.input = claim("key", group);
+    group.statusEl = claim("status", group);
+    group.button = claim("unlock", group);
+    group.attribution = claimAll("attribution", group);
+
+    // Only the missing pieces are generated, so a page can hand over as much or as
+    // little of the furniture as it likes.
+    var inputId = "reportseal-key-" + index;
+    var parts = [];
+    if (!group.input) {
+      parts.push(
+        '<form class="reportseal-form" autocomplete="off">' +
+          '<label for="' + inputId + '">Decryption key</label>' +
+          '<textarea id="' + inputId + '" spellcheck="false" ' +
+            'placeholder="Paste a key (NO1.…) — any valid key opens this page"></textarea>' +
+          '<button type="submit">Unlock</button>' +
+          (group.statusEl ? "" :
+            '<p class="reportseal-status" role="status" aria-live="polite"></p>') +
+        '</form>');
+    } else if (!group.statusEl) {
+      parts.push('<p class="reportseal-status" role="status" aria-live="polite"></p>');
+    }
+    parts.push('<p class="reportseal-locked">The remainder of this page is encrypted.</p>');
+    parts.push('<p class="reportseal-remembered" hidden>This key is remembered on this ' +
+               'device. <button type="button" class="reportseal-forget">Forget key</button></p>');
+    parts.push('<p class="reportseal-expiry" role="note" hidden></p>');
+
+    var ui = document.createElement("div");
+    ui.innerHTML = parts.join("");
+    var first = group.items[0];
+    first.parentNode.insertBefore(ui, first);
+    group.ui = ui;
+
+    if (!group.input) {
+      group.input = ui.querySelector("textarea");
+      group.form = ui.querySelector(".reportseal-form");
+    } else {
+      group.form = group.input.form;
+    }
+    if (!group.statusEl) { group.statusEl = ui.querySelector(".reportseal-status"); }
+    if (!group.form && !group.button) {
+      // an entry box was supplied with nothing to submit it; give it a button
+      var fallback = document.createElement("button");
+      fallback.type = "button";
+      fallback.textContent = "Unlock";
+      group.input.parentNode.insertBefore(fallback, group.input.nextSibling);
+      group.button = fallback;
+    }
+    return ui;
+  }
+
+  // A host-supplied element keeps whatever classes the page gave it; only the
+  // state classes are toggled.
+  function say(group, msg, cls) {
+    group.statusEl.textContent = msg;
+    group.statusEl.classList.remove("ok", "err");
+    group.statusEl.classList.add("reportseal-status");
+    if (cls) { group.statusEl.classList.add(cls); }
+  }
+
+  // Remembering the key, scoped to the epoch set and page id so two documents
+  // opened from the same machine never pick up each other's key. Every access is
+  // guarded: storage can be absent or throw, and that must never stop an unlock.
+  function storeKey(group) {
+    return "reportseal/v2/" + group.epochs + "/" + group.page;
+  }
+
+  function recall(group) {
+    try { return window.localStorage.getItem(storeKey(group)); } catch (e) { return null; }
+  }
+
+  function remember(group, token) {
+    try { window.localStorage.setItem(storeKey(group), token); return true; }
+    catch (e) { return false; }
+  }
+
+  function forget(group) {
+    try { window.localStorage.removeItem(storeKey(group)); } catch (e) { /* nothing to do */ }
+  }
+
+  // ------------------------------------------------------------------- unlocking
+
+  // Checks the token itself: signature first, then that it is for this group.
+  // Returns the parsed payload and the slot its epoch occupies in the page's list.
+  async function checkToken(group, token) {
+    var m = /^NO1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(token.trim());
+    if (!m) { throw new Error("That does not look like a key (expected NO1.….…)."); }
+    var p64 = m[1], s64 = m[2];
+    var first = group.items[0];
+
+    // The signature is the only hard gate: it proves the key server issued this
+    // key and that nobody edited its data block.
+    var verifyKey = await crypto.subtle.importKey(
+      "jwk", { kty: "EC", crv: "P-256", x: first.dataset.signX, y: first.dataset.signY },
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    var sigOk = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" }, verifyKey, b64uToBytes(s64), enc.encode(p64));
+    if (!sigOk) { throw new Error("Key rejected: signature is not valid."); }
+
+    var payload = JSON.parse(dec.decode(b64uToBytes(p64)));
+    if (payload.v !== 2) {
+      throw new Error("Key format v" + payload.v + " is not one this page understands.");
+    }
+    var epochs = String(group.epochs).split("+");
+    var slot = epochs.indexOf(payload.epoch);
+    if (slot < 0) {
+      throw new Error("Key belongs to epoch '" + payload.epoch +
+                      "'; this page was sealed under '" + epochs.join("', '") + "'.");
+    }
+    if (payload.page !== group.page) {
+      throw new Error("Key was issued for page '" + payload.page +
+                      "'; this page is '" + group.page + "'.");
+    }
+
+    return { payload: payload, slot: slot };
+  }
+
+  // One fragment: one pairing, then HKDF and AES-GCM. Each fragment carries its own
+  // ephemeral point and IV, so this runs per fragment even for a shared key.
+  async function openFragment(el, payload, slot) {
+    var B = window.bls12_381;
+    if (!B) { throw new Error("The curve library did not load, so this page cannot be decrypted."); }
+
+    var sk, c1;
+    try {
+      sk = B.G1.Point.fromBytes(b64uToBytes(payload.sk));
+      c1 = B.G2.Point.fromBytes(b64uToBytes(String(el.dataset.c1).split("+")[slot]));
+    } catch (e) {
+      throw new Error("Key rejected: its page element is malformed.");
+    }
+    var shared = B.fields.Fp12.toBytes(B.pairing(sk, c1));
+
+    var ikm = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+    var kBits = await crypto.subtle.deriveBits({
+      name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0),
+      info: enc.encode("reportseal/v2|" + el.dataset.epochs + "|" + el.dataset.page)
+    }, ikm, 256);
+    var key = await crypto.subtle.importKey("raw", kBits, "AES-GCM", false, ["decrypt"]);
+
+    var plain = await crypto.subtle.decrypt({
+      name: "AES-GCM", iv: b64uToBytes(el.dataset.iv), tagLength: 128,
+      additionalData: enc.encode(el.dataset.epochs + "|" + el.dataset.page)
+    }, key, b64uToBytes((el.textContent || "").replace(/\s+/g, "")));
+
+    var bytes = new Uint8Array(plain);
+    if (el.dataset.encoding === "gzip") { bytes = await inflate(bytes); }
+    return dec.decode(bytes);
+  }
+
+  function reveal(el, html) {
+    var section = document.createElement("section");
+    section.className = "reportseal-content";
+    section.innerHTML = html;
+    el.parentNode.insertBefore(section, el.nextSibling);
+    el.setAttribute("data-reportseal-open", "");
+  }
+
+  // Expiry notice and attribution are page level: with several groups the last
+  // unlock wins, which is fine.
+  function reportExpiry(group, exp) {
+    if (!exp) { return; }
+    var el = group.ui.querySelector(".reportseal-expiry");
+    var when = new Date(exp);
+    if (isNaN(when.getTime())) {
+      el.textContent = "This key carries an expiry value this page cannot read (" +
+                       exp + "). The content below was decrypted anyway.";
+    } else if (when.getTime() < Date.now()) {
+      el.textContent = "This key expired on " + fmt(when) +
+                       ". The content below was still decrypted — expiry is a notice only.";
+    } else {
+      return;
+    }
+    el.classList.add("reportseal-expiry", "expired");
+    el.hidden = false;
+  }
+
+  // Values a page may interpolate with $$reportseal-token$$. Beyond these,
+  // $$reportseal-extra:KEY$$ reaches any field the issuer put in the key. The
+  // prefix keeps a page's own $$...$$ text out of the way, and an unknown token is
+  // left as it stands so a typo is visible rather than silently blank.
+  function tokenValue(name, group, payload, meta) {
+    if (name === "page") { return group.page; }
+    if (name === "epoch") { return payload.epoch; }
+    if (name === "exp") {
+      var when = meta.exp ? new Date(meta.exp) : null;
+      return when && !isNaN(when.getTime()) ? fmt(when) : "unknown";
+    }
+    if (name.indexOf("extra:") === 0) {
+      var key = name.slice(6);
+      return key in meta ? String(meta[key]) : "unknown";
+    }
+    if (name in meta) { return String(meta[name]); }
+    return null;
+  }
+
+  // Substitution happens in text nodes, never through innerHTML, so a value can
+  // never bring markup of its own into the page.
+  function substitute(root, group, payload, meta) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+    var nodes = [], node;
+    while ((node = walker.nextNode()) !== null) { nodes.push(node); }
+    var found = false;
+    nodes.forEach(function (text) {
+      if (text.nodeValue.indexOf("$$reportseal-") < 0) { return; }
+      text.nodeValue = text.nodeValue.replace(/\$\$reportseal-([A-Za-z0-9_.:-]+)\$\$/g,
+        function (whole, name) {
+          var value = tokenValue(name, group, payload, meta);
+          if (value === null) { return whole; }
+          found = true;
+          return value;
+        });
+    });
+    return found;
+  }
+
+  function attribute(group, meta, payload) {
+    var first = group.items[0];
+    if (first.hasAttribute("data-no-attribution")) { return; }
+
     var when = meta.exp ? new Date(meta.exp) : null;
     var line = "Issued to " + (meta.name || "unknown") +
                " · " + (meta.institution || "unknown") +
                " · valid until " +
                (when && !isNaN(when.getTime()) ? fmt(when) : "unknown");
 
-    var target = document.querySelector("[data-reportseal-attribution]");
-    if (!target) {
-      target = document.createElement("p");
-      target.className = "reportseal-attribution";
-      ui.insertBefore(target, ui.firstChild);
+    if (group.attribution.length) {
+      // The page owns the wording. Where it wrote $$tokens$$ those are filled in;
+      // where it left the element empty it gets the default line.
+      group.attribution.forEach(function (target) {
+        if (!substitute(target, group, payload, meta) && !target.textContent.trim()) {
+          target.textContent = line;
+        }
+        target.hidden = false;
+      });
+      return;
     }
-    target.textContent = line;
-    target.hidden = false;
+
+    var generated = document.createElement("p");
+    generated.className = "reportseal-attribution";
+    generated.textContent = line;
+    group.ui.insertBefore(generated, group.ui.firstChild);
   }
 
-  function reveal(result, fromStore) {
-    var content = ui.querySelector(".reportseal-content");
-    content.innerHTML = result.html;
-    content.hidden = false;
-    ui.querySelector(".reportseal-locked").hidden = true;
+  function keyData(group, meta) {
+    var handled = { name: 1, institution: 1, exp: 1, kid: 1 };
+    var rows = Object.keys(meta).filter(function (k) { return !handled[k]; });
+    if (!rows.length) { return; }
+    var section = document.createElement("section");
+    section.className = "reportseal-keydata";
+    section.innerHTML = "<h2>Key data</h2><dl></dl>";
+    var dl = section.querySelector("dl");
+    rows.forEach(function (k) {
+      var dt = document.createElement("dt");
+      dt.textContent = k;
+      var dd = document.createElement("dd");
+      dd.textContent = typeof meta[k] === "object" ? JSON.stringify(meta[k]) : String(meta[k]);
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    });
+    group.ui.parentNode.appendChild(section);
+  }
 
-    // All metadata travels in the token's "extra" block. Three fields have meaning
-    // to this page, the key id is the issuer's bookkeeping and is never shown, and
-    // anything else is listed underneath the content as-is.
-    var meta = result.payload.extra || {};
-    reportExpiry(meta.exp);
-    if (showAttribution) { attribute(meta); }
+  // Each fragment decides for itself whether an expired key is enough, so one key
+  // can open some regions of a page and be turned away by others. A courtesy rather
+  // than a control either way: the holder's element still works, so anyone
+  // determined can decrypt without this page.
+  function expiredFor(el, payload) {
+    if (!el.hasAttribute("data-enforce-expiry")) { return false; }
+    var exp = payload.extra && payload.extra.exp;
+    if (!exp) { return false; }
+    var until = new Date(exp);
+    return !isNaN(until.getTime()) && until.getTime() < Date.now();
+  }
 
-    // Keep the key for next time, so this page opens without retyping it.
-    var kept = fromStore || remember(result.token);
+  async function unlockGroup(group, token, fromStore) {
+    var checked = await checkToken(group, token);
+    var opened = [];
+    var refused = 0;
+    for (var n = 0; n < group.items.length; n++) {
+      if (expiredFor(group.items[n], checked.payload)) {
+        opened.push(null);
+        refused++;
+        continue;
+      }
+      opened.push(await openFragment(group.items[n], checked.payload, checked.slot));
+    }
+
+    if (refused === group.items.length) {
+      var until = new Date(checked.payload.extra.exp);
+      var all = new Error("This key expired on " + fmt(until) +
+                          ", and this page is set to refuse expired keys.");
+      all.expired = true;
+      throw all;
+    }
+
+    for (var m = 0; m < opened.length; m++) {
+      if (opened[m] !== null) { reveal(group.items[m], opened[m]); }
+    }
+
+    var meta = checked.payload.extra || {};
+    reportExpiry(group, meta.exp);
+    attribute(group, meta, checked.payload);
+    keyData(group, meta);
+    group.ui.querySelector(".reportseal-locked").hidden = true;
+
+    var kept = fromStore || remember(group, token.trim());
     if (kept) {
-      var note = ui.querySelector(".reportseal-remembered");
+      var note = group.ui.querySelector(".reportseal-remembered");
       note.hidden = false;
       note.querySelector(".reportseal-forget").addEventListener("click", function () {
-        forget();
+        forget(group);
         location.reload();
       });
     }
 
-    var handled = { name: 1, institution: 1, exp: 1, kid: 1 };
-    var dl = ui.querySelector(".reportseal-keydata dl");
-    var rows = [];
-    Object.keys(meta).forEach(function (k) {
-      if (handled[k]) { return; }
-      rows.push([k, typeof meta[k] === "object" ? JSON.stringify(meta[k]) : String(meta[k])]);
-    });
-    rows.forEach(function (row) {
-      var dt = document.createElement("dt");
-      dt.textContent = row[0];
-      var dd = document.createElement("dd");
-      dd.textContent = row[1];
-      dl.appendChild(dt);
-      dl.appendChild(dd);
-    });
-    ui.querySelector(".reportseal-keydata").hidden = rows.length === 0;
-
-    window.reportseal = { payload: result.payload, extra: meta };
-    // Deliberately no key id here: it is for the issuer's logs, not the reader.
-    say(fromStore ? "Unlocked with a remembered key." : "Unlocked.", "ok");
-    form.hidden = true;
+    window.reportseal = { payload: checked.payload, extra: meta };
+    var head = fromStore ? "Unlocked with a remembered key." : "Unlocked.";
+    var detail = "";
+    if (group.items.length > 1 || refused) {
+      detail = " " + (group.items.length - refused) + " of " + group.items.length +
+               " sections unlocked.";
+    }
+    if (refused) {
+      detail += " " + refused + (refused === 1 ? " section refuses" : " sections refuse") +
+                " expired keys.";
+    }
+    say(group, head + detail, "ok");
+    if (group.form) { group.form.hidden = true; }
+    else if (group.input) { group.input.hidden = true; if (group.button) { group.button.hidden = true; } }
   }
 
-  function fail(err) {
+  function fail(group, err) {
     var msg = err && err.message ? err.message : String(err);
     // AES-GCM failures surface as a bare OperationError.
     if (!msg || err.name === "OperationError") {
       msg = "Key rejected: the encrypted section did not authenticate.";
     }
-    say(msg, "err");
+    say(group, msg, "err");
   }
 
-  form.addEventListener("submit", function (ev) {
-    ev.preventDefault();
+  groups.forEach(function (group, index) {
+    buildUi(group, index);
+
+    function submitted(ev) {
+      if (ev) { ev.preventDefault(); }
+      if (!hasWebCrypto()) {
+        say(group, "This browser exposes no WebCrypto here, so the page cannot be decrypted.", "err");
+        return;
+      }
+      say(group, "Checking key…");
+      unlockGroup(group, group.input.value, false).catch(function (err) { fail(group, err); });
+    }
+
+    if (group.form) { group.form.addEventListener("submit", submitted); }
+    if (group.button) { group.button.addEventListener("click", submitted); }
+
+    // A demo page may ship with a key already in the box. It still has to pass
+    // every check a typed key does; this only saves the paste.
+    var debugKey = group.items[0].dataset.debugKey;
+    if (debugKey) { group.input.value = debugKey; }
+
     if (!hasWebCrypto()) {
-      say("This browser exposes no WebCrypto here, so the page cannot be decrypted.", "err");
+      say(group, "This browser exposes no WebCrypto here, so the page cannot be decrypted.", "err");
       return;
     }
-    say("Checking key…");
-    unlock(input.value).then(function (r) { reveal(r, false); }).catch(fail);
-  });
 
-  // A key remembered from an earlier visit opens the page with no interaction. If
-  // it no longer works — the epoch was rotated, or the entry was tampered with —
-  // discard it and fall back to the form.
-  if (!hasWebCrypto()) {
-    say("This browser exposes no WebCrypto here, so the page cannot be decrypted.", "err");
-  } else {
-    var saved = recall();
+    // A key remembered from an earlier visit opens the page with no interaction. If
+    // it no longer works the entry form comes back; an expired key is kept, since
+    // it is still a valid key the page is declining.
+    var saved = recall(group);
     if (saved) {
-      say("Unlocking with a remembered key…");
-      unlock(saved).then(function (r) { reveal(r, true); }).catch(function (err) {
-        if (err && err.expired) {
-          // Still a valid key, just past its date: keep it and say so.
-          fail(err);
-          return;
-        }
-        forget();
-        say("The remembered key no longer opens this page, so it was discarded.", "err");
+      say(group, "Unlocking with a remembered key…");
+      unlockGroup(group, saved, true).catch(function (err) {
+        if (err && err.expired) { fail(group, err); return; }
+        forget(group);
+        say(group, "The remembered key no longer opens this page, so it was discarded.", "err");
       });
     }
-  }
+  });
 })();

@@ -42,6 +42,13 @@ namespace ReportSeal.Sealing
         private G2Projective offsetGenerator;
         private readonly string[] c1List;
         private Gt shared;
+        private Sealer.BodyJob body;
+
+        /// <summary>
+        /// True while an asynchronous cipher has the body and has not answered yet.
+        /// The step that started it is repeated on each call until it does.
+        /// </summary>
+        public bool IsWaitingOnCipher => body != null && !body.Job.IsComplete;
 
         internal SealOperation(
             byte[] plaintext,
@@ -123,17 +130,26 @@ namespace ReportSeal.Sealing
                         return true;
                     }
                     if (Result != null) { return false; }
-                    // cheap: derive the key, encrypt, assemble the markup
-                    byte[] iv;
-                    var ciphertext = Sealer.SealBody(
-                        plaintext, epochNames, pageId, shared, options.Compress, out iv);
+
+                    // derive the key and hand the body to the cipher; an asynchronous
+                    // one may take several calls, which yield without advancing
+                    if (body == null)
+                    {
+                        body = Sealer.BeginBody(
+                            plaintext, epochNames, pageId, shared, options.Compress,
+                            options.Cipher ?? PlatformAesGcm.Instance);
+                    }
+                    if (!body.Job.IsComplete) { return true; }
+
+                    var iv = body.Iv;
+                    var ciphertext = Sealer.FinishBody(body);
                     var elementId = Sealer.NewElementId();
                     Result = new SealedFragment(
                         elementId,
                         Sealer.Markup(elementId, epochNames, pageId, iv, ciphertext,
                             string.Join("+", c1List), signX, signY, options, debugToken),
                         UnlockAssets.Styles,
-                        UnlockAssets.Script(elementId));
+                        UnlockAssets.Script());
                     step++;
                     return false;
             }

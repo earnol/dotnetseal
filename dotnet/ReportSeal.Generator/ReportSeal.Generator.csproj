@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../ReportSeal.Sealing/ReportSeal.Sealing.csproj" />
+    <ProjectReference Include="../ReportSeal.Pages/ReportSeal.Pages.csproj" />
   </ItemGroup>
 
 </Project>

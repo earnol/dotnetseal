@@ -27,7 +27,11 @@ namespace ReportSeal.Sealing
 
         public static string Styles => Read(StyleFile);
 
-        public static string Script(string elementId)
+        /// <summary>
+        /// The unlock code, identical for every page: it discovers each sealed
+        /// element itself, so one copy serves any number of fragments.
+        /// </summary>
+        public static string Script()
         {
             var sb = new StringBuilder();
             foreach (var file in ScriptFiles)
@@ -35,7 +39,7 @@ namespace ReportSeal.Sealing
                 if (sb.Length > 0) { sb.Append('\n'); }
                 sb.Append(Read(file));
             }
-            return sb.ToString().Replace("__ID__", elementId);
+            return sb.ToString();
         }
 
         private static string Read(string file)

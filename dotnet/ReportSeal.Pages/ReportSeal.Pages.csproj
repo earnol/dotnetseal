@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>ReportSeal.Pages</RootNamespace>
+    <AssemblyName>ReportSeal.Pages</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- the page-level interface sits on top of the low-level one; a caller that
+         wants to lay pages out itself can reference only ReportSeal.Sealing -->
+    <ProjectReference Include="../ReportSeal.Sealing/ReportSeal.Sealing.csproj" />
+  </ItemGroup>
+
+</Project>
