@@ -1,6 +1,6 @@
 # .NET sealer - Proof of Concept
 
-A .NET generator seals part of a web page; a PHP issuer mints unlimited keys that
+.NET generator seals part of a web page; a PHP issuer mints unlimited keys that
 open it; the browser decrypts on `file://` with WebCrypto and no dependencies.
 
 The two halves never talk to each other. The .NET side holds only a **public**
@@ -10,18 +10,23 @@ halves and is the only place keys can be created.
 ## Layout
 
 ```
+config/reportseal.example.php  every setting, with its default; copy to config/reportseal.php
 keys/signpublic.pem       signature verification key, in PEM for openssl and people
-keys/epochs.json          published table: epoch id -> master public key, + the same verify key
-keys/private/             PHP only: signprivate.pem (signing), master-<epoch>.key (master scalar)
-keys/issued.log           append-only record of what the web UI issued (never the key itself)
-php/setup.php             create signing key + epoch master scalars, publish public halves
+keys/epochs.json          published table: epoch id -> master public key, + the verify key, signed
+keys/private/             signprivate.pem.enc, master-<epoch>.key.enc (encrypted), master-<epoch>.pub
+keys/issued.log           append-only record of every issued key (never the key itself)
+php/setup.php             create the signing key and epochs, publish and sign the table
 php/issue.php             mint one signed token for one page
+php/lib/config.php        settings and their defaults
+php/lib/keystore.php      passwords; keys encrypted with Argon2id + AES-256-GCM
+php/lib/recorder.php      record of issued keys: log file, and MariaDB when configured
 php/lib/bls12381.php      BLS12-381 G1/G2 arithmetic on bcmath, issuer side only
+php/sql/mariadb.sql       the table recorder.php writes into
 php/web/index.php         key issuing UI
 dotnet/ReportSeal.Sealing/    netstandard2.1 library: encryption + the three page parts
 dotnet/ReportSeal.Pages/      netstandard2.1 library: ReportSeal markers, whole-page sealing
 dotnet/ReportSeal.Sealing/assets/  unlock.js and unlock.css, embedded as resources
-dotnet/ReportSeal.Generator/  runnable CLI host (net10.0): I/O, key table, page assembly
+dotnet/ReportSeal.Generator/  runnable CLI host (net10.0): reads the page, writes the result
 dotnet/ReportSeal.SelfTest/   pairing constant, stepwise sealing and thread-safety checks
 samples/fragment-to-seal.html    a bare fragment, used by the suite to build pages
 samples/page-one-document.html   one page id, two fragments, differing EnforceExpiry
@@ -32,8 +37,8 @@ test/setup.sh             build the key fixtures the suite needs (epochs E1, E2 
 test/e2e.sh               full pipeline verified in headless Chrome on file://
 ```
 
-`keys/epochs.json` stands in for the future read-only SQL table. Swap the file
-read in `Program.Run`/`publish_table()` for a query and nothing else changes.
+Every path above is a default and can be moved through the config file — see
+*Configuration*. `keys/epochs.json` stands in for a future read-only SQL table.
 
 ## The .NET side
 
@@ -236,6 +241,8 @@ because a fault in any of them has one symptom: no page decrypts.
 | | Version | Needed for |
 |---|---|---|
 | PHP | 8.1+ with `openssl` and `bcmath` | issuing keys; bcmath carries the curve arithmetic |
+| OpenSSL | 3.2+ command line | Argon2id, which unlocks the encrypted keys |
+| PHP `pdo_mysql` | any | only if issued keys go to MariaDB |
 | .NET SDK | 10 | the generator; the library itself targets netstandard2.1 |
 | Chrome | 80+, headless | `test/e2e.sh` only |
 
@@ -250,9 +257,12 @@ test/setup.sh      # once: signing key plus epochs E1, E2 and E3
 test/e2e.sh        # the suite; refuses to run until the fixtures exist
 ```
 
-`setup.sh --force` throws the key store away and rebuilds it. Keeping this out of
-`e2e.sh` saves about 14 seconds a run, since publishing the table derives every
-epoch's public half, and means a test run never rewrites your keys.
+`setup.sh --force` throws the key store away and rebuilds it. Because the keys are
+encrypted, the suite needs their passwords: `test/setup.sh` keeps the ones it uses
+in `out/fixture-passwords` (mode `0600`, ignored by git with the rest of `out/`).
+Deleting `out/` loses them; `test/setup.sh` then rebuilds the key store. That file exists only
+for the throwaway development keys; nothing in `php/` writes a password down. Keeping this out of
+`e2e.sh` saves about 14 seconds a run and means a test run never rewrites your keys.
 
 Browsers opening a sealed page need WebCrypto and, unless every fragment was
 sealed with `Compress: false`, `DecompressionStream`: Chrome 80+, Firefox 113+, Safari 16.4+.
@@ -352,11 +362,15 @@ A caller that would rather lay the page out itself can reference
 and returns the three parts.
 
 Keys are minted one at a time, each with its own data block. A caller issuing
-keys programmatically should skip the CLI and call the library directly:
+keys programmatically should skip the CLI and call the library directly — unlock
+once, then mint as many as needed, recording each:
 
 ```php
 require 'php/lib/reportseal.php';
-$token = mint_token('E1', 'DOC-1234', ['kid' => 'acct-4471', 'name' => 'A. Example']);
+$issuer = unlock_issuer('E1', $signingPassword, $epochPassword);
+$token  = mint_token($issuer, 'DOC-1234', ['kid' => 'acct-4471', 'name' => 'A. Example']);
+record_issue(['kid' => 'acct-4471', 'epoch' => 'E1', 'page' => 'DOC-1234',
+              'name' => 'A. Example', 'institution' => 'unknown', 'exp' => null], 'cli');
 ```
 
 ## The scheme
@@ -367,7 +381,7 @@ Sakai-Kasahara over BLS12-381, with the ECDSA signature layer on P-256 because
 WebCrypto verifies that natively.
 
 An epoch is one master keypair. The master scalar `s` never leaves
-`keys/private/`; only `X = s*G2` is published. The identity of a page is
+`keys/private/`, and is encrypted there; only `X = s*G2` is published. The identity of a page is
 `id = SHA-256("reportseal/v2|" + pageId) mod r`, which all three sides derive
 independently — that tagged string is the one thing they must agree on exactly.
 
@@ -543,33 +557,82 @@ Every key the web UI issues is appended to `keys/issued.log` with a timestamp; t
 command line and `mint_token` do not log. The token itself is never logged, because
 it is the decryption key.
 
-The same thing from the command line, or from your own PHP:
+The same thing from the command line:
 
 ```bash
-php php/issue.php --page DOC-1234 --kid acct-4471 --exp 2027-01-31 --name 'A. Example'
+php php/issue.php --epoch E1 --page DOC-1234 --kid acct-4471 --exp 2027-01-31 --name 'A. Example'
 ```
 
-```php
-require 'php/lib/reportseal.php';
-$token = mint_token('E1', 'DOC-1234', ['kid' => 'acct-4471', 'name' => 'A. Example',
-                                       'institution' => 'Example Institute']);
-```
+It asks for the two passwords, or reads them as two lines from stdin, or takes
+`--signing-password` and `--epoch-password`.
+
+### Recording issued keys in MariaDB
+
+Set `db` in the config (see `config/reportseal.example.php`) and create the table
+with `php/sql/mariadb.sql`. Each issued key then becomes a row — time, source,
+key id, epoch, page, name, institution, expiry — alongside its log line. The
+database password is read from an environment variable named in the config, never
+from the config file. The issuer only inserts, so its account needs `INSERT` on that
+one table.
+
+**This layer has not been run against a real MariaDB server.** No PHP build on the
+development machine carries `pdo_mysql`. The same PDO code was exercised against
+SQLite, and the schema is written for MariaDB, but test it before relying on it.
 
 ## Generating keypairs
 
 There are two kinds of key, both created by `setup.php`. Nothing private ever
-leaves `keys/private/`.
+leaves `keys/private/`, and nothing private is stored there unencrypted.
 
 | Keypair | Private half | Public half | Replacing it |
 |---|---|---|---|
-| **Signing** (ECDSA P-256, signs keys) | `keys/private/signprivate.pem` | `keys/signpublic.pem` and `signpublic` in `keys/epochs.json` | invalidates *every* key ever issued |
-| **Epoch master** (BLS12-381, opens pages) | `keys/private/master-<epoch>.key` | `epochs.<id>` in `keys/epochs.json` | old keys stop opening newly sealed pages |
+| **Signing** (ECDSA P-256, signs keys) | `keys/private/signprivate.pem.enc` | `keys/signpublic.pem` and `signpublic` in `keys/epochs.json` | invalidates *every* key ever issued |
+| **Epoch master** (BLS12-381, opens pages) | `keys/private/master-<epoch>.key.enc` | `epochs.<id>` in `keys/epochs.json` | old keys stop opening newly sealed pages |
 
 First run — creates the signing key and the first epoch master scalar:
 
 ```bash
 php php/setup.php
 ```
+
+### Passwords
+
+The **signing key** is encrypted under a password you choose on the first run. Every
+later `setup.php` run asks for it, because each run re-signs the table, and so does
+every key issued.
+
+Each **epoch** is encrypted under a password `setup.php` generates when it creates
+the epoch, prints once, and keeps nowhere:
+
+```
+========================================================================
+  Password for epoch E2: UiAtBs22CLY5dQ7S9jcX
+  Shown this once and stored nowhere. Without it, epoch E2 cannot
+  issue keys, and the only remedy is a new epoch.
+========================================================================
+```
+
+Record it then. It is 20 characters, about 116 bits, drawn without the easily
+confused `0 O o 1 l I`. A lost epoch password cannot be recovered; pages sealed under
+that epoch stay readable with keys already issued, but no new key can be minted for
+it.
+
+A chosen password needs at least 12 characters of letters, digits and
+`- _ . , ! @ # % = : { } [ ] ( )`. That leaves out quotes, `?`, `+`, backslash,
+backtick, `$ & * ; | < > ^ ~` and spaces.
+
+Passwords are never written to disk, a log or the database. Each script takes one
+from the terminal without echo, from stdin when that is a pipe, or from a command
+line option. The web UI takes them in the form on each request.
+
+Keys are stored as a small JSON envelope: Argon2id (64 MiB, 3 passes, 4 lanes by
+default) stretches the password into an AES-256-GCM key, and the parameters and
+salt are kept in the envelope, so changing them later never strands an existing
+file. GCM's tag means a wrong password is reported as such. Each envelope also
+states what it holds, so an epoch file cannot be passed off as the signing key.
+
+Argon2id comes from the OpenSSL 3.2+ command line, because neither PHP nor the
+OpenSSL it links against here provides it.
 
 Add a new epoch (the normal path; keeps the old one working):
 
@@ -578,17 +641,35 @@ php php/setup.php --epoch E2
 ```
 
 Replace an existing key in place. Both refuse without `--force`, because each
-throws away already-issued keys:
+throws away already-issued keys; replacing an epoch prints a new password for it:
 
 ```bash
 php php/setup.php --epoch E2 --force    # new master scalar for E2
 php php/setup.php --issuer --force      # new signing key: all keys become unusable
 ```
 
-Every run rebuilds `keys/epochs.json` from whatever private material is present,
-so the table always matches the key store. Deriving each public half is one G2
-multiply, a couple of seconds apiece. Copy that one file to the .NET side after
-any of these commands — it holds public halves only.
+`php php/setup.php --publish` re-signs and republishes the table without creating
+anything.
+
+Every run rebuilds `keys/epochs.json` from the epochs present, so the table always
+matches the key store. It needs no epoch password: each epoch's public half is
+derived once, when the epoch is created, and kept beside its encrypted scalar as
+`master-<epoch>.pub`. Publish the table where the pages' `Table:` points after any
+of these commands — it holds public halves only.
+
+### The signed table
+
+`epochs.json` carries a `signature` over its own content: remove the `signature`
+member, serialise what remains as RFC 8785 canonical JSON — sorted keys, no
+whitespace — and verify ECDSA-P256-SHA256 over those bytes with the table's
+`signpublic` key. The canonical form is what lets PHP and .NET agree on the signed
+bytes however the file happens to be laid out.
+
+`ReportSeal.Pages` checks it before sealing anything, and refuses an altered or an
+unsigned table. Because the check uses the key inside the table, it
+proves the table is intact and was signed by whoever holds that key; it does not by
+itself prove who that is, since someone able to replace the whole file could re-sign
+it with their own key. Transport security covers that case.
 
 Inspect the verification key with plain openssl, without touching anything private:
 
@@ -600,6 +681,45 @@ openssl ec -pubin -in keys/signpublic.pem -text -noout
 key in two shapes — a PEM for tooling and people, raw `x`/`y` because that is what
 the generator hands to WebCrypto. Both are rewritten from the private key on every
 `setup.php` run, so they cannot drift.
+
+## Configuration
+
+Settings live in `config/reportseal.php`, or in the file named by the
+`REPORTSEAL_CONFIG` environment variable. The file is optional: every setting has a
+default that reproduces the layout above. `config/reportseal.example.php` lists them
+all.
+
+| Setting | Default | |
+|---|---|---|
+| `table` | `keys/epochs.json` | the published table; point it into a web server's document root to serve it |
+| `signpublic` | `keys/signpublic.pem` | the verification key as PEM |
+| `private_dir` | `keys/private` | encrypted keys and epoch public halves |
+| `issued_log` | `keys/issued.log` | `null` turns the log off |
+| `openssl` | `openssl` | an OpenSSL 3.2+ binary |
+| `argon2` | 64 MiB, 3 passes, 4 lanes | for newly written key files |
+| `db` | `null` | MariaDB recording; see above |
+
+Relative paths are taken from the repository root. An unknown setting is an error,
+so a misspelt key cannot silently fall back to a default.
+
+## Deployment checks
+
+Two properties of the issuing server affect where a password can be seen, and a
+development machine says nothing about either. Check them where keys are issued.
+
+- **Process arguments.** Argon2id runs as a separate `openssl kdf` process, which
+  takes the password only as an argument — in hex, for about a quarter of a second.
+  So do `--signing-password` and `--epoch-password`. Whether other users can read
+  another user's arguments depends on how `/proc` is mounted: with `hidepid=2` (or
+  `hidepid=invisible`) only the owner and root can.
+  `grep ' /proc ' /proc/mounts` shows it.
+- **Execution auditing.** If `auditd` records `execve` with its arguments, a
+  password passed as an argument is written to the audit log on disk.
+  `auditctl -l | grep execve` (as root) shows whether it does.
+
+A password typed on the command line is also saved in shell history unless the shell
+is told otherwise — `HISTCONTROL=ignorespace` with a leading space, for instance.
+The terminal prompt avoids that.
 
 ## Rotation
 
@@ -628,7 +748,8 @@ the only withdrawal mechanism.
 
 What does hold: only the issuer can produce a token the page will accept, a key
 cannot be moved to another page, and the metadata block cannot be altered by its
-holder.
+holder. Minting a key needs both the signing password and the epoch's password; a
+copy of `keys/private/` alone is not enough.
 
 Decrypted HTML is injected with `innerHTML`. It is authenticated by AES-GCM
 under a key only reachable through a signed token, so the trust boundary is the

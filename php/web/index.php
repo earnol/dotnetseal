@@ -6,8 +6,13 @@
  *
  *   php -S 127.0.0.1:8080 -t php/web
  *
- * There is deliberately no access control here: anyone who can reach this page can
- * mint a key that opens every sealed page of the selected epoch.
+ * It asks for the signing password on every request and holds no password between
+ * requests, but has no access control of its own: anyone who can reach it and knows
+ * the passwords can mint keys and create epochs.
+ *
+ * Two forms post here: issuing a key (action=issue) and creating an epoch
+ * (action=create_epoch). A new epoch's password is shown once in the response and
+ * kept nowhere.
  */
 
 declare(strict_types=1);
@@ -44,15 +49,51 @@ function h(string $s): string
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+/** The next free id of the form E<n>, as a suggestion for a new epoch. */
+function next_epoch_id(array $epochs): string
+{
+    $n = 0;
+    foreach ($epochs as $e) {
+        if (preg_match('/^E(\d+)$/', $e, $m)) {
+            $n = max($n, (int) $m[1]);
+        }
+    }
+    return 'E' . ($n + 1);
+}
+
+// A response may carry a token or a new epoch password: never cache it.
+header('Cache-Control: no-store');
+header('Pragma: no-cache');
+
 $epochs = available_epochs();
 $token = null;
 $error = null;
 $issued = [];
 $posted = $_SERVER['REQUEST_METHOD'] === 'POST';
+$action = $posted ? (string) ($_POST['action'] ?? 'issue') : '';
+
+// Epoch creation. Only adds: replacing an epoch invalidates keys issued under it,
+// which stays a deliberate command-line step (setup.php --epoch X --force).
+$created = null;          // ['epoch' => …, 'password' => …] once, in this response
+$epochError = null;
+$newEpoch = $action === 'create_epoch' ? field('new_epoch', 32) : next_epoch_id($epochs);
+if ($action === 'create_epoch') {
+    try {
+        // One action: create the epoch and re-sign the table, with the signing
+        // password held in this request only.
+        $added = add_epoch($newEpoch, (string) ($_POST['signing_password'] ?? ''));
+        $created = ['epoch' => $newEpoch, 'password' => $added['password']];
+        $epochs = available_epochs();
+        $newEpoch = next_epoch_id($epochs);
+    } catch (Throwable $e) {
+        $epochError = $e->getMessage();
+    }
+}
 
 // Sticky values, so a rejected form comes back filled in.
 $in = [
-    'epoch'       => $posted ? field('epoch', 32) : (end($epochs) ?: ''),
+    'epoch'       => $action === 'issue' ? field('epoch', 32)
+                     : ($created['epoch'] ?? (end($epochs) ?: '')),
     'page_id'     => field('page_id', 64),
     'name'        => field('name'),
     'institution' => field('institution'),
@@ -61,7 +102,7 @@ $in = [
     'kid'         => field('kid', 40),
 ];
 
-if ($posted) {
+if ($action === 'issue') {
     try {
         if ($epochs === []) {
             throw new RuntimeException('no epochs exist yet — run: php php/setup.php');
@@ -86,12 +127,29 @@ if ($posted) {
         $exp = $expDate . 'T' . $expTime . ':00Z';
         $kid = $in['kid'] !== '' ? $in['kid'] : random_kid();
 
-        $token = mint_token($in['epoch'], $in['page_id'], [
+        // Passwords are read straight from the request and never kept: not in the
+        // sticky form values, not in the log, not in the database, not in errors.
+        $issuer = unlock_issuer(
+            $in['epoch'],
+            (string) ($_POST['signing_password'] ?? ''),
+            (string) ($_POST['epoch_password'] ?? '')
+        );
+        $token = mint_token($issuer, $in['page_id'], [
             'kid'         => $kid,
             'exp'         => $exp,
             'name'        => $name,
             'institution' => $institution,
         ]);
+
+        // Recorded before the token is shown; if recording fails, no token is.
+        record_issue([
+            'kid'         => $kid,
+            'epoch'       => $in['epoch'],
+            'page'        => $in['page_id'],
+            'name'        => $name,
+            'institution' => $institution,
+            'exp'         => normalise_exp($exp),
+        ], 'web');
 
         $issued = [
             'Key id'      => $kid,
@@ -103,22 +161,9 @@ if ($posted) {
             'Expires'     => normalise_exp($exp),
             'Length'      => strlen($token) . ' characters',
         ];
-
-        // Issuing log. Never records the token itself: that is the decryption key.
-        @file_put_contents(
-            dirname(__DIR__, 2) . '/keys/issued.log',
-            gmdate('c') . "\t" . json_encode([
-                'kid'         => $kid,
-                'epoch'       => $in['epoch'],
-                'page'        => $in['page_id'],
-                    'name'        => $name,
-                'institution' => $institution,
-                'exp'         => normalise_exp($exp),
-            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n",
-            FILE_APPEND | LOCK_EX
-        );
     } catch (Throwable $e) {
         $error = $e->getMessage();
+        $token = null;
     }
 }
 ?>
@@ -147,6 +192,9 @@ if ($posted) {
   dl { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 1rem 0; }
   dt { font-weight: 600; }
   dd { margin: 0; font-family: ui-monospace, monospace; }
+  .secret { border: 2px solid #b7950b; padding: .75rem 1rem; margin: 1rem 0; }
+  .secret .key { font-size: 1.25rem; letter-spacing: .05em; user-select: all; }
+  section + section { border-top: 1px solid #8884; margin-top: 2.5rem; padding-top: 1rem; }
 </style>
 </head>
 <body>
@@ -156,7 +204,22 @@ if ($posted) {
 cannot open another, and that boundary is cryptographic.</p>
 
 <p class="warn">This page reads the private keys. Keep it on loopback only —
-anyone who can load it can mint keys.</p>
+anyone who can load it and knows the passwords can mint keys.</p>
+
+<?php if ($created !== null): ?>
+  <div class="secret" role="alert">
+    <h2>Epoch <?= h($created['epoch']) ?> created</h2>
+    <p>Its password:</p>
+    <p class="key"><?= h($created['password']) ?></p>
+    <p><strong>Record it now.</strong> It is shown this once and stored nowhere —
+    not on disk, not in a log. Without it, epoch <?= h($created['epoch']) ?> cannot
+    issue keys, and the only remedy is a new epoch.</p>
+    <p class="muted">The key table has been re-signed with <?= h($created['epoch']) ?>
+    in it. Publish it where the pages' <code>Table:</code> points.</p>
+  </div>
+<?php endif; ?>
+
+<section>
 
 <?php if ($error !== null): ?>
   <p class="err"><?= h($error) ?></p>
@@ -178,6 +241,7 @@ anyone who can load it can mint keys.</p>
 <?php endif; ?>
 
 <form method="post">
+  <input type="hidden" name="action" value="issue">
   <label>Epoch
     <span>Which master keypair the key belongs to.</span>
     <select name="epoch" required>
@@ -223,8 +287,47 @@ anyone who can load it can mint keys.</p>
     <input name="kid" value="<?= h($in['kid']) ?>" autocomplete="off" maxlength="40">
   </label>
 
+  <label>Signing key password
+    <span>Chosen when the key store was set up.</span>
+    <input name="signing_password" type="password" autocomplete="off" required>
+  </label>
+
+  <label>Password for the epoch
+    <span>Shown once when the epoch was created.</span>
+    <input name="epoch_password" type="password" autocomplete="off" required>
+  </label>
+
   <button type="submit">Issue key</button>
 </form>
+</section>
+
+<section>
+<h2>Create an epoch</h2>
+<p class="muted">A new master keypair. Keys issued under other epochs do not open
+pages sealed only under it. Its password is generated and shown once.</p>
+
+<?php if ($epochError !== null): ?>
+  <p class="err"><?= h($epochError) ?></p>
+<?php endif; ?>
+
+<form method="post">
+  <input type="hidden" name="action" value="create_epoch">
+  <label>Epoch id
+    <span>Letters, digits and <code>_ . -</code>, up to 32 characters. Existing:
+    <?= $epochs === [] ? 'none' : h(implode(', ', $epochs)) ?>.</span>
+    <input name="new_epoch" value="<?= h($newEpoch) ?>" autocomplete="off" required
+           maxlength="32" pattern="[A-Za-z0-9_.\-]{1,32}">
+  </label>
+
+  <label>Signing key password
+    <span>Needed to re-sign the key table with the new epoch in it.</span>
+    <input name="signing_password" type="password" autocomplete="off" required>
+  </label>
+
+  <button type="submit">Create epoch</button>
+  <span class="muted">Takes a few seconds.</span>
+</form>
+</section>
 
 </body>
 </html>

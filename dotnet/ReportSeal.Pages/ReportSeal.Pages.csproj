@@ -14,4 +14,8 @@
     <ProjectReference Include="../ReportSeal.Sealing/ReportSeal.Sealing.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="reportseal-selftest" />
+  </ItemGroup>
+
 </Project>

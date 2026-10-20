@@ -29,12 +29,16 @@ namespace ReportSeal.Pages
     /// <summary>The sealed page and an account of what went into it.</summary>
     public sealed class SealedPage
     {
-        internal SealedPage(string html, SealedFragmentInfo[] fragments, bool styledByPage)
+        internal SealedPage(string html, SealedFragmentInfo[] fragments, bool styledByPage, KeyTable table)
         {
             Html = html;
             Fragments = fragments;
             StyledByPage = styledByPage;
+            Table = table;
         }
+
+        /// <summary>The key table the page was sealed with, its signature checked.</summary>
+        public KeyTable Table { get; }
 
         public string Html { get; }
 
@@ -45,6 +49,22 @@ namespace ReportSeal.Pages
         /// styles were left out.
         /// </summary>
         public bool StyledByPage { get; }
+    }
+
+    /// <summary>
+    /// The seams page-level sealing goes through. Every member may be left null for
+    /// the runtime's own implementation.
+    /// </summary>
+    public sealed class PageSealOptions
+    {
+        /// <summary>AES-GCM to encrypt with; null for <see cref="PlatformAesGcm"/>.</summary>
+        public IAesGcm Cipher { get; set; }
+
+        /// <summary>Fetches the key table; null for <see cref="DefaultTableSource"/>.</summary>
+        public ITableSource TableSource { get; set; }
+
+        /// <summary>Checks the table's signature; null for <see cref="PlatformEcdsaVerifier"/>.</summary>
+        public IEcdsaVerifier Verifier { get; set; }
     }
 
     /// <summary>
@@ -68,14 +88,20 @@ namespace ReportSeal.Pages
     ///
     /// <code>
     /// &lt;!-- ReportSeal PageID: DOC-5643, Epoch: E1+E3, Compress: true,
-    ///      EnforceExpiry: false, ShowAttribution: true --&gt;
+    ///      EnforceExpiry: false, ShowAttribution: true,
+    ///      Table: https://issuer.example/epochs.json --&gt;
     ///   …content to seal…
     /// &lt;!-- EndOfReportSeal --&gt;
     /// </code>
     ///
     /// Several regions may appear on one page. Those sharing a page id and epoch set
     /// are opened together by one key, which the browser arranges by grouping them;
-    /// nothing extra is needed here.
+    /// nothing extra is needed here. Every region on a page must name the same table.
+    ///
+    /// <c>Table:</c> is an <c>https://</c>, <c>http://</c> or <c>file://</c> location; a
+    /// relative <c>file://</c> path is taken from the running executable's directory — see
+    /// <see cref="TableLocation.Resolve"/>. Its signature is checked before anything is
+    /// sealed. The value may not contain a comma, which separates marker keys.
     /// </summary>
     public static class PageSealer
     {
@@ -86,35 +112,49 @@ namespace ReportSeal.Pages
         public const int MaxEpochsPerFragment = 3;
 
         private static readonly string[] RequiredKeys =
-            { "PageID", "Epoch", "Compress", "EnforceExpiry", "ShowAttribution" };
+            { "PageID", "Epoch", "Compress", "EnforceExpiry", "ShowAttribution", "Table" };
 
+        /// <summary>
+        /// Seals the page in one call. The key table is fetched and checked first; a
+        /// fetch made through <see cref="Pending{T}.FromTask"/>, as the default source
+        /// does, is waited for. A seam that answers through a callback cannot be waited
+        /// for on a single-threaded host and is refused — use <see cref="BeginSeal"/>.
+        /// </summary>
         /// <param name="pageHtml">The complete page, markers and all.</param>
-        /// <param name="available">Every epoch the key table publishes.</param>
-        /// <param name="signX">Signature verification key X, base64url.</param>
-        /// <param name="signY">Signature verification key Y, base64url.</param>
-        /// <param name="cipher">
-        /// AES-GCM to encrypt with; null for the runtime's own. Page-level sealing is
-        /// synchronous, so an asynchronous cipher is refused here — seal fragments with
-        /// <see cref="Sealer.BeginSeal"/> instead.
-        /// </param>
-        public static SealedPage Seal(
-            string pageHtml, EpochKey[] available, string signX, string signY, IAesGcm cipher = null)
+        public static SealedPage Seal(string pageHtml, PageSealOptions options = null)
+        {
+            var operation = BeginSeal(pageHtml, options);
+            while (operation.MoveNext())
+            {
+                operation.WaitOrRefuse();
+            }
+            return operation.Result;
+        }
+
+        /// <summary>
+        /// Begins sealing the page one step at a time; call <c>MoveNext</c> until it
+        /// returns false, then read <c>Result</c>. Malformed markers are reported here,
+        /// before anything is fetched.
+        /// </summary>
+        public static PageSealOperation BeginSeal(string pageHtml, PageSealOptions options = null)
         {
             if (pageHtml == null) throw new ArgumentNullException(nameof(pageHtml));
-            if (available == null) throw new ArgumentNullException(nameof(available));
+            return new PageSealOperation(pageHtml, Scan(pageHtml), options ?? new PageSealOptions());
+        }
 
-            var byId = new Dictionary<string, EpochKey>(StringComparer.Ordinal);
-            foreach (var key in available)
-            {
-                byId[key.Id] = key;
-            }
+        /// <summary>One marked region, as found in the page.</summary>
+        internal sealed class Region
+        {
+            public int Open;
+            public int CloseEnd;
+            public Dictionary<string, string> Options;
+            public string Fragment;
+        }
 
-            var output = new StringBuilder();
-            var fragments = new List<SealedFragmentInfo>();
-            var styles = (string)null;
-            var script = (string)null;
+        private static List<Region> Scan(string pageHtml)
+        {
+            var regions = new List<Region>();
             var cursor = 0;
-
             while (true)
             {
                 var open = FindComment(pageHtml, cursor, OpenMarker, out var openEnd, out var body);
@@ -144,35 +184,17 @@ namespace ReportSeal.Pages
                 }
 
                 var options = ParseMarker(body, open);
-                var epochs = ResolveEpochs(options, byId, open);
-                var fragment = pageHtml.Substring(openEnd, close - openEnd);
-
-                var sealedFragment = Sealer.Seal(
-                    Encoding.UTF8.GetBytes(fragment),
-                    epochs,
-                    options["PageID"],
-                    signX,
-                    signY,
-                    new SealOptions
-                    {
-                        Compress = Flag(options, "Compress", open),
-                        EnforceExpiry = Flag(options, "EnforceExpiry", open),
-                        ShowAttribution = Flag(options, "ShowAttribution", open),
-                        Cipher = cipher,
-                    });
-
-                output.Append(pageHtml, cursor, open - cursor);
-                output.Append(sealedFragment.Markup);
-
-                styles = styles ?? sealedFragment.Styles;
-                script = script ?? sealedFragment.Script;
-
-                var ids = new string[epochs.Length];
-                for (var i = 0; i < epochs.Length; i++) { ids[i] = epochs[i].Id; }
-                fragments.Add(new SealedFragmentInfo(
-                    options["PageID"], ids, sealedFragment.ElementId,
-                    Encoding.UTF8.GetByteCount(fragment)));
-
+                CheckEpochList(options, open);
+                Flag(options, "Compress", open);
+                Flag(options, "EnforceExpiry", open);
+                Flag(options, "ShowAttribution", open);
+                regions.Add(new Region
+                {
+                    Open = open,
+                    CloseEnd = closeEnd,
+                    Options = options,
+                    Fragment = pageHtml.Substring(openEnd, close - openEnd),
+                });
                 cursor = closeEnd;
             }
 
@@ -183,20 +205,64 @@ namespace ReportSeal.Pages
                     "found " + CloseMarker + " at offset " + trailingClose +
                     " with no matching " + OpenMarker);
             }
-
-            if (fragments.Count == 0)
+            if (regions.Count == 0)
             {
                 throw new PageMarkupException(
                     "the page contains no " + OpenMarker + " marker, so there is nothing to seal");
             }
 
-            output.Append(pageHtml, cursor, pageHtml.Length - cursor);
-
-            // The styles and the unlock code go in once, however many fragments there
-            // are: the script finds them all by itself.
-            var html = Inject(output.ToString(), styles, script, out var styledByPage);
-            return new SealedPage(html, fragments.ToArray(), styledByPage);
+            // checked now so a page that cannot be assembled fails before any fetch
+            if (pageHtml.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                throw new PageMarkupException("the page has no </body> for the unlock script");
+            }
+            if (!StylesTheUi(pageHtml) && pageHtml.LastIndexOf("</head>", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                throw new PageMarkupException("the page has no </head> for the unlock styles");
+            }
+            return regions;
         }
+
+        /// <summary>The page's one table location, the same in every marker.</summary>
+        internal static Uri TableOf(List<Region> regions)
+        {
+            Uri first = null;
+            string firstText = null;
+            foreach (var region in regions)
+            {
+                var text = region.Options["Table"];
+                Uri location;
+                try
+                {
+                    location = TableLocation.Resolve(text);
+                }
+                catch (KeyTableException ex)
+                {
+                    throw new PageMarkupException("marker at offset " + region.Open + ": " + ex.Message);
+                }
+                if (first == null)
+                {
+                    first = location;
+                    firstText = text;
+                }
+                else if (!string.Equals(first.AbsoluteUri, location.AbsoluteUri, StringComparison.Ordinal))
+                {
+                    throw new PageMarkupException(
+                        "marker at offset " + region.Open + " names the table '" + text +
+                        "', but an earlier marker names '" + firstText +
+                        "'; every fragment on a page must use the same table");
+                }
+            }
+            return first;
+        }
+
+        internal static SealOptions FragmentOptions(Region region, IAesGcm cipher) => new SealOptions
+        {
+            Compress = Flag(region.Options, "Compress", region.Open),
+            EnforceExpiry = Flag(region.Options, "EnforceExpiry", region.Open),
+            ShowAttribution = Flag(region.Options, "ShowAttribution", region.Open),
+            Cipher = cipher,
+        };
 
         /// <summary>
         /// Finds the next <c>&lt;!-- name …  --&gt;</c>, returning its start, the offset
@@ -288,8 +354,7 @@ namespace ReportSeal.Pages
             return options;
         }
 
-        private static EpochKey[] ResolveEpochs(
-            Dictionary<string, string> options, Dictionary<string, EpochKey> byId, int offset)
+        private static string[] CheckEpochList(Dictionary<string, string> options, int offset)
         {
             var names = options["Epoch"].Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
             if (names.Length == 0)
@@ -303,7 +368,13 @@ namespace ReportSeal.Pages
                     MaxEpochsPerFragment + " is allowed, because a page readable under more than " +
                     "that is usually a mistake");
             }
+            return names;
+        }
 
+        internal static EpochKey[] ResolveEpochs(
+            Dictionary<string, string> options, Dictionary<string, EpochKey> byId, int offset)
+        {
+            var names = CheckEpochList(options, offset);
             var keys = new EpochKey[names.Length];
             for (var i = 0; i < names.Length; i++)
             {
@@ -343,7 +414,7 @@ namespace ReportSeal.Pages
             return pageHtml.IndexOf(".reportseal-", StringComparison.Ordinal) >= 0;
         }
 
-        private static string Inject(string html, string styles, string script, out bool styledByPage)
+        internal static string Inject(string html, string styles, string script, out bool styledByPage)
         {
             styledByPage = StylesTheUi(html);
             var withStyles = styledByPage

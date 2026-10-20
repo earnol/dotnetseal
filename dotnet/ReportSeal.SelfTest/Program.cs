@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Security.Cryptography;
 using Neo.Cryptography.BLS12_381;
+using ReportSeal.Pages;
 using ReportSeal.Sealing;
 
 namespace ReportSeal.SelfTest;
@@ -237,6 +240,76 @@ internal static class Program
         Check("all 32 produced output", results.All(r => r != null && r.Markup.Length > 0));
         Check("element ids are unique", results.Select(r => r.ElementId).Distinct().Count() == results.Length);
 
+        Console.WriteLine("== canonical JSON, as the table signature needs it");
+        Check("keys sorted, no whitespace",
+            CanonicalJson.Write(CanonicalJson.Parse("{ \"b\" : 1, \"a\" : [true, null, \"x\"] }")) == "{\"a\":[true,null,\"x\"],\"b\":1}");
+        Check("sorted by UTF-16 code unit",
+            CanonicalJson.Write(CanonicalJson.Parse("{\"\\u00e9\":1,\"z\":2,\"Z\":3}")) == "{\"Z\":3,\"z\":2,\"\u00e9\":1}");
+        Check("minimal escapes, non-ASCII kept",
+            CanonicalJson.Write(CanonicalJson.Parse("\"\\u00c5\\/\\u0001\\n\\\"\"")) == "\"\u00c5/\\u0001\\n\\\"\"");
+        foreach (var bad in new[] { "{\"a\":1,\"a\":2}", "1.5", "1e3", "9007199254740992", "\"\\ud800\"", "{\"a\":1} x", "[1,]" })
+        {
+            try { CanonicalJson.Parse(bad); Check("rejects " + bad, false); }
+            catch (FormatException) { Check("rejects " + bad, true); }
+        }
+
+        Console.WriteLine("== page sealing through callback seams, as on Unity WebGL");
+        using (var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256))
+        {
+            var q = signer.ExportParameters(false).Q;
+            var tableJson = SignedTable(signer, mpk, mpk2);
+            const string Page = "<html><head></head><body><!-- ReportSeal PageID: DOC-1, Epoch: E1+E2, Compress: true, "
+                + "EnforceExpiry: false, ShowAttribution: true, Table: https://issuer.example/epochs.json -->"
+                + "<p>SELFTEST-PLAINTEXT</p><!-- EndOfReportSeal --></body></html>";
+
+            var source = new LaterSource(tableJson);
+            var verifier = new LaterVerifier();
+            var pageOp = PageSealer.BeginSeal(Page, new PageSealOptions { TableSource = source, Verifier = verifier });
+            Check("the marker's location is reported", pageOp.TableLocation.AbsoluteUri == "https://issuer.example/epochs.json");
+            var waitedForTable = false;
+            var waitedForSignature = false;
+            var guard = 0;
+            while (pageOp.MoveNext() && guard++ < 10000)
+            {
+                if (pageOp.IsWaiting && source.Asked != null && !source.Answered) { waitedForTable = true; source.Answer(); }
+                else if (pageOp.IsWaiting && verifier.Asked != null && !verifier.Asked.IsComplete) { waitedForSignature = true; verifier.Answer(); }
+            }
+            Check("yields while the table is fetched", waitedForTable);
+            Check("yields while the signature is checked", waitedForSignature);
+            Check("the page is sealed", pageOp.IsDone && pageOp.Result.Html.Contains("data-reportseal") && !pageOp.Result.Html.Contains("SELFTEST-PLAINTEXT"));
+            Check("the table's verify key is used", pageOp.Result.Html.Contains(Base64Url.Encode(q.X)));
+            Check("both epochs are offered", pageOp.Result.Table.Epochs.Count == 2);
+
+            try { PageSealer.Seal(Page, new PageSealOptions { TableSource = new LaterSource(tableJson) }); Check("Seal refuses a callback source", false); }
+            catch (InvalidOperationException ex) { Check("Seal refuses a callback source", ex.Message.Contains("BeginSeal")); }
+
+            var viaTask = PageSealer.Seal(Page, new PageSealOptions
+            {
+                TableSource = new TaskSource(tableJson),
+            });
+            Check("Seal waits for a task-backed source", viaTask.Fragments.Length == 1);
+
+            var tampered = tableJson.Replace("\"version\":2", "\"version\":2,\"note\":\"x\"");
+            try { PageSealer.Seal(Page, new PageSealOptions { TableSource = new TaskSource(tampered) }); Check("an added member breaks the signature", false); }
+            catch (KeyTableException ex) { Check("an added member breaks the signature", ex.Message.Contains("does not verify")); }
+
+            try { PageSealer.BeginSeal(Page.Replace("https://issuer.example/epochs.json", "gopher://x/t.json")); Check("refuses gopher:", false); }
+            catch (PageMarkupException ex) { Check("refuses gopher:", ex.Message.Contains("only https://")); }
+
+            Check("relative file:// is taken from the executable",
+                TableLocation.Resolve("file://keys/t.json").LocalPath == Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "keys/t.json")));
+            Check("file:/// is absolute", TableLocation.Resolve("file:///srv/keys/t.json").LocalPath == "/srv/keys/t.json");
+            Check("percent-escapes are decoded", TableLocation.Resolve("file:///srv/my%20keys/t.json").LocalPath == "/srv/my keys/t.json");
+            foreach (var bad in new[] { "keys/t.json", "/srv/keys/t.json", "file:/srv/t.json", "file://" })
+            {
+                try { TableLocation.Resolve(bad); Check("refuses Table: " + bad, false); }
+                catch (KeyTableException) { Check("refuses Table: " + bad, true); }
+            }
+
+            try { PageSealer.BeginSeal(Page.Replace(", Table: https://issuer.example/epochs.json", "")); Check("Table is required", false); }
+            catch (PageMarkupException ex) { Check("Table is required", ex.Message.Contains("'Table'")); }
+        }
+
         Console.WriteLine("== cost of a step, for scheduling decisions");
         var timings = new List<double>();
         var timed = Sealer.BeginSeal(body, e1, "DOC-timing", SignX, SignY);
@@ -328,6 +401,47 @@ internal static class Program
             Array.Copy(full, cut, cut.Length);
             return AesGcmJob.Completed(cut);
         }
+    }
+
+    private static string SignedTable(ECDsa signer, byte[] mpk, byte[] mpk2)
+    {
+        var q = signer.ExportParameters(false).Q;
+        var body = "{\"epochs\":{\"E1\":\"" + Base64Url.Encode(mpk) + "\",\"E2\":\"" + Base64Url.Encode(mpk2)
+            + "\"},\"signpublic\":{\"x\":\"" + Base64Url.Encode(q.X) + "\",\"y\":\"" + Base64Url.Encode(q.Y) + "\"},\"version\":2}";
+        var sig = signer.SignData(Encoding.UTF8.GetBytes(body), HashAlgorithmName.SHA256);
+        return body.Substring(0, body.Length - 1) + ",\"signature\":\"" + Base64Url.Encode(sig) + "\"}";
+    }
+
+    /// <summary>Answers only when told to, like a browser callback.</summary>
+    private sealed class LaterSource : ITableSource
+    {
+        private readonly string json;
+        public Pending<string> Asked;
+        public bool Answered;
+        public LaterSource(string json) { this.json = json; }
+        public Pending<string> Fetch(Uri location) { Asked = new Pending<string>(); return Asked; }
+        public void Answer() { Answered = true; Asked.Complete(json); }
+    }
+
+    private sealed class LaterVerifier : IEcdsaVerifier
+    {
+        private byte[] key, sig, data;
+        public Pending<bool> Asked;
+        public Pending<bool> Verify(byte[] publicKey, byte[] signature, byte[] signed)
+        {
+            key = publicKey; sig = signature; data = signed;
+            Asked = new Pending<bool>();
+            return Asked;
+        }
+        public void Answer() => Asked.Complete(PlatformEcdsaVerifier.Instance.Verify(key, sig, data).Result);
+    }
+
+    private sealed class TaskSource : ITableSource
+    {
+        private readonly string json;
+        public TaskSource(string json) { this.json = json; }
+        public Pending<string> Fetch(Uri location) =>
+            Pending<string>.FromTask(Task.Run(async () => { await Task.Delay(20); return json; }));
     }
 
     private static void Check(string name, bool ok)

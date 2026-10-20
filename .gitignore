@@ -4,3 +4,4 @@ dotnet/**/bin/
 dotnet/**/obj/
 keys/issued.log
 test/env.sh
+config/reportseal.php

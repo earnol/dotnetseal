@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../ReportSeal.Sealing/ReportSeal.Sealing.csproj" />
+    <ProjectReference Include="../ReportSeal.Pages/ReportSeal.Pages.csproj" />
     <!-- referenced directly so the test can recompute the pairing it is checking -->
     <PackageReference Include="Neo.Cryptography.BLS12_381" Version="3.9.0" />
   </ItemGroup>

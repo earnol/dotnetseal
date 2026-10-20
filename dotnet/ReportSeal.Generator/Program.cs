@@ -1,14 +1,12 @@
 using System.Text;
-using System.Text.Json.Nodes;
 using ReportSeal.Pages;
-using ReportSeal.Sealing;
 
 namespace ReportSeal.Generator;
 
 /// <summary>
 /// Command line host. The page says what to seal, through ReportSeal comments, so
-/// this program only reads files, parses the key table, and hands the markup to
-/// ReportSeal.Pages as a string.
+/// this program only reads and writes files. The markers name the key table, and
+/// ReportSeal.Pages fetches it and checks its signature.
 /// </summary>
 internal static class Program
 {
@@ -21,6 +19,11 @@ internal static class Program
         catch (PageMarkupException ex)
         {
             Console.Error.WriteLine("error in the page: " + ex.Message);
+            return 1;
+        }
+        catch (KeyTableException ex)
+        {
+            Console.Error.WriteLine("error: " + ex.Message);
             return 1;
         }
         catch (Exception ex)
@@ -37,38 +40,28 @@ internal static class Program
         {
             Console.Error.WriteLine(
                 """
-                usage: reportseal-gen --in <page.html> --out <file> [--table <file>]
+                usage: reportseal-gen --in <page.html> --out <file>
 
                   --in <page.html>  a complete page whose regions to seal are marked with
                                     <!-- ReportSeal PageID: …, Epoch: …, Compress: …,
-                                         EnforceExpiry: …, ShowAttribution: … -->
+                                         EnforceExpiry: …, ShowAttribution: …, Table: … -->
                                       …content…
                                     <!-- EndOfReportSeal -->
+                                    Table is an https://, http:// or file:// location; a
+                                    relative file:// path is taken from this executable's directory
                   --out <file>      page to write
-                  --table <file>    published key table (default ../../keys/epochs.json)
                 """);
             return 2;
         }
 
-        var table = JsonNode.Parse(File.ReadAllText(opt.Table))!.AsObject();
-        var published = table["epochs"]!.AsObject();
-        var available = published
-            .Select(e => new EpochKey(e.Key, Base64Url.Decode((string)e.Value!)))
-            .ToArray();
-        if (available.Length == 0)
-        {
-            throw new InvalidOperationException($"{opt.Table} lists no epochs — run php/setup.php");
-        }
-
-        var sealedPage = PageSealer.Seal(
-            File.ReadAllText(opt.In),
-            available,
-            (string)table["signpublic"]!["x"]!,
-            (string)table["signpublic"]!["y"]!);
+        var sealedPage = PageSealer.Seal(File.ReadAllText(opt.In));
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(opt.Out))!);
         File.WriteAllText(opt.Out, sealedPage.Html, new UTF8Encoding(false));
 
+        var table = sealedPage.Table;
+        Console.WriteLine($"table   : {(table.Location.IsFile ? table.Location.LocalPath : table.Location.AbsoluteUri)} "
+            + $"(signature verified; epochs {string.Join(", ", table.Epochs.Select(e => e.Id))})");
         Console.WriteLine($"sealed  : {sealedPage.Fragments.Length} fragment(s)");
         Console.WriteLine($"styles  : {(sealedPage.StyledByPage ? "the page's own" : "defaults injected")}");
         foreach (var fragment in sealedPage.Fragments)
@@ -95,12 +88,11 @@ internal static class Program
         return Convert.ToHexString(digest).ToLowerInvariant().Substring(0, 12);
     }
 
-    private sealed record Options(string In, string Out, string Table)
+    private sealed record Options(string In, string Out)
     {
         public static Options? Parse(string[] args)
         {
             string? input = null, output = null;
-            var table = Path.Combine(AppContext.BaseDirectory, "../../../../../keys/epochs.json");
 
             for (var i = 0; i < args.Length; i++)
             {
@@ -109,12 +101,11 @@ internal static class Program
                 {
                     case "--in": input = next; i++; break;
                     case "--out": output = next; i++; break;
-                    case "--table": table = next!; i++; break;
                     default: return null;
                 }
             }
             if (input is null || output is null) return null;
-            return new Options(input, output, Path.GetFullPath(table));
+            return new Options(input, output);
         }
     }
 }

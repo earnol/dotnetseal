@@ -35,6 +35,26 @@ else
   load_chrome() { :; }
 fi
 
+# Keys are encrypted at rest; test/setup.sh records the fixture passwords here.
+FIXTURE=$ROOT/out/fixture-passwords
+[ -f "$FIXTURE" ] || { echo "no $FIXTURE — run test/setup.sh first"; exit 1; }
+declare -A FIXTURE_PW=()
+while IFS='=' read -r name value; do FIXTURE_PW[$name]=$value; done < "$FIXTURE"
+
+# php/issue.php with the fixture passwords for whichever --epoch the call names.
+issue() {
+  local epoch="" a
+  local -a args=("$@")
+  for ((a = 0; a < ${#args[@]}; a++)); do
+    [ "${args[$a]}" = "--epoch" ] && epoch=${args[$((a + 1))]}
+  done
+  php php/issue.php "$@" --signing-password "${FIXTURE_PW[SIGN]}" \
+                         --epoch-password "${FIXTURE_PW[$epoch]:-}"
+}
+
+TABLE_FILE=$ROOT/keys/epochs.json
+TABLE=file://$TABLE_FILE
+
 # ---------------------------------------------------------------- build inputs
 load_php
 
@@ -55,24 +75,24 @@ PYEOF
 
 PAGE=DOC-1234
 OTHER=DOC-5678
-TOKEN=$(php php/issue.php --epoch E1 --page $PAGE --kid acct-4471 --extra '{"tier":"gold"}')
-TOKEN_EXPIRED=$(php php/issue.php --epoch E1 --page $PAGE --kid old-key --exp 2020-03-01)
-TOKEN_FUTURE=$(php php/issue.php --epoch E1 --page $PAGE --kid new-key --exp 2099-12-31)
-TOKEN_RANDOMKID=$(php php/issue.php --epoch E1 --page $PAGE)
-TOKEN_UI=$(php php/issue.php --epoch E1 --page $PAGE --kid acct-4471 --exp 2027-01-31 \
+TOKEN=$(issue --epoch E1 --page $PAGE --kid acct-4471 --extra '{"tier":"gold"}')
+TOKEN_EXPIRED=$(issue --epoch E1 --page $PAGE --kid old-key --exp 2020-03-01)
+TOKEN_FUTURE=$(issue --epoch E1 --page $PAGE --kid new-key --exp 2099-12-31)
+TOKEN_RANDOMKID=$(issue --epoch E1 --page $PAGE)
+TOKEN_UI=$(issue --epoch E1 --page $PAGE --kid acct-4471 --exp 2027-01-31 \
     --name 'A. Example' --institution 'Example Institute')
-TOKEN_BLANK=$(php php/issue.php --epoch E1 --page $PAGE --exp 9999-12-31 --name unknown --institution unknown)
-TOKEN_OTHERPAGE=$(php php/issue.php --epoch E1 --page $OTHER --kid wrong-page)
+TOKEN_BLANK=$(issue --epoch E1 --page $PAGE --exp 9999-12-31 --name unknown --institution unknown)
+TOKEN_OTHERPAGE=$(issue --epoch E1 --page $OTHER --kid wrong-page)
 UNIPAGE='DOC-Årsrapport-Übersicht'
-TOKEN_UNICODE=$(php php/issue.php --epoch E1 --page "$UNIPAGE" --kid 'nyckel-Åsa' \
+TOKEN_UNICODE=$(issue --epoch E1 --page "$UNIPAGE" --kid 'nyckel-Åsa' \
     --name 'Åsa Müller-Désirée' --institution 'Universität Göttingen' 2>/dev/null)
 EXP_PAST=$(local_moment 2020-03-01T00:00:00Z)
 EXP_FUTURE=$(local_moment 2099-12-31T00:00:00Z)
 EXP_UI=$(local_moment 2027-01-31T00:00:00Z)
 EXP_NEVER=$(local_moment 9999-12-31T00:00:00Z)
-TOKEN_E2=$(php php/issue.php --epoch E2 --page $PAGE --kid wrong-epoch)
-TOKEN_E2_OWN=$(php php/issue.php --epoch E2 --page $PAGE --kid e2-user)
-TOKEN_E3_OWN=$(php php/issue.php --epoch E3 --page $PAGE --kid e3-user)
+TOKEN_E2=$(issue --epoch E2 --page $PAGE --kid wrong-epoch)
+TOKEN_E2_OWN=$(issue --epoch E2 --page $PAGE --kid e2-user)
+TOKEN_E3_OWN=$(issue --epoch E3 --page $PAGE --kid e3-user)
 
 
 load_dotnet
@@ -84,13 +104,13 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
   echo '<header><h1>Quarterly Summary</h1>'
   echo '<p class="muted" data-reportseal-attribution hidden></p></header>'
   echo "<!-- ReportSeal PageID: $PAGE, Epoch: E1, Compress: true,"
-  echo "     EnforceExpiry: false, ShowAttribution: true -->"
+  echo "     EnforceExpiry: false, ShowAttribution: true, Table: $TABLE -->"
   cat "$ROOT/samples/fragment-to-seal.html"
   echo '<!-- EndOfReportSeal -->'
   echo '</body></html>'
 } > "$OUT/page-src.html"
 (cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-    --table "$ROOT/keys/epochs.json" --in "$OUT/page-src.html" \
+    --in "$OUT/page-src.html" \
     --out "$OUT/page.html" >/dev/null 2>&1) \
   || { echo "generate failed"; exit 1; }
 
@@ -250,14 +270,14 @@ write_and_seal() {
     echo '<header><h1>Quarterly Summary</h1>'
     echo '<p class="muted" data-reportseal-attribution hidden></p></header>'
     echo "<!-- ReportSeal PageID: $pageid, Epoch: $epoch, Compress: $compress,"
-    echo "     EnforceExpiry: $enforce, ShowAttribution: $attribution -->"
+    echo "     EnforceExpiry: $enforce, ShowAttribution: $attribution, Table: $TABLE -->"
     cat "$ROOT/samples/fragment-to-seal.html"
     echo '<!-- EndOfReportSeal -->'
     echo '</body></html>'
   } > "$src"
   load_dotnet
   (cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-      --table "$ROOT/keys/epochs.json" --in "$src" --out "$out" >/dev/null 2>&1) \
+      --in "$src" --out "$out" >/dev/null 2>&1) \
     || { echo "  FAIL could not seal $name"; fail=$((fail+1)); return 1; }
   echo "$out"
 }
@@ -266,10 +286,10 @@ write_and_seal() {
 # $1 tag, $2 description
 expect_markup_error() {
   local tag=$1 desc=$2 src=$WORK/bad-$1.html
-  cat > "$src"
+  sed "s|@TABLE@|$TABLE|g" > "$src"
   load_dotnet
   if (cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-        --table "$ROOT/keys/epochs.json" --in "$src" \
+        --in "$src" \
         --out "$WORK/bad-$1-out.html" >/dev/null 2>&1); then
     fail=$((fail+1)); printf '  FAIL %s was accepted\n' "$desc"
   else
@@ -516,11 +536,11 @@ check "accented institution"      "$DOM" "Universität Göttingen"           y
 # The two sides print a fingerprint of the identity so a page id that differs only
 # by Unicode composition is visible. They must agree, or the hint misleads.
 load_php
-PHP_FP=$(php php/issue.php --epoch E1 --page "$UNIPAGE" --kid fp-probe 2>&1 >/dev/null \
+PHP_FP=$(issue --epoch E1 --page "$UNIPAGE" --kid fp-probe 2>&1 >/dev/null \
          | grep -o 'page identity [0-9a-f]*' | awk '{print $3}')
 load_dotnet
 GEN_FP=$(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-    --table "$ROOT/keys/epochs.json" --in "$WORK/unicode-src.html" \
+    --in "$WORK/unicode-src.html" \
     --out "$WORK/fp.html" 2>/dev/null \
   | grep -o 'identity [0-9a-f]*' | head -1 | awk '{print $2}')
 if [ -n "$PHP_FP" ] && [ "$PHP_FP" = "$GEN_FP" ]; then
@@ -534,7 +554,7 @@ echo "== several fragments on one page"
 MULTI=$WORK/multi.html
 load_dotnet
 (cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-    --table "$ROOT/keys/epochs.json" --in "$ROOT/samples/page-one-document.html" \
+    --in "$ROOT/samples/page-one-document.html" \
     --out "$MULTI" >/dev/null 2>&1) \
   || { echo "  FAIL could not seal the sample page"; fail=$((fail+1)); }
 SRC=$(cat "$MULTI")
@@ -562,7 +582,7 @@ check "refusal explained"           "$DOM" "refuses expired keys"  y
 echo "== malformed markers are refused"
 expect_markup_error unterminated "an unclosed ReportSeal" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 </body></html>
 EOF
@@ -574,15 +594,15 @@ expect_markup_error orphan "an EndOfReportSeal with no opener" <<'EOF'
 EOF
 expect_markup_error nested "a nested ReportSeal" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
-<!-- ReportSeal PageID: DOC-5678, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
+<!-- ReportSeal PageID: DOC-5678, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
 EOF
 expect_markup_error unknownkey "an unknown marker key" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC-1234, Epcoh: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epcoh: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
@@ -596,21 +616,21 @@ expect_markup_error missingkey "a marker missing a key" <<'EOF'
 EOF
 expect_markup_error badbool "a non-boolean flag" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: yes, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: yes, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
 EOF
 expect_markup_error unknownepoch "an epoch the table lacks" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC-1234, Epoch: E9, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E9, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
 EOF
 expect_markup_error badpageid "a page id with a forbidden character" <<'EOF'
 <!DOCTYPE html><html><head><title>x</title></head><body>
-<!-- ReportSeal PageID: DOC|1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC|1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
@@ -622,7 +642,7 @@ expect_markup_error nomarkers "a page with no markers at all" <<'EOF'
 EOF
 expect_markup_error nohead "a page with no head for the styles" <<'EOF'
 <html><body>
-<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: @TABLE@ -->
 <p>SEALED</p>
 <!-- EndOfReportSeal -->
 </body></html>
@@ -631,12 +651,21 @@ EOF
 echo "== one page carrying two page ids"
 # samples/page-two-documents.html seals DOC-1234 and DOC-5678 side by side, so the
 # fragments fall into two groups and each gets its own entry box
+# Its markers name http://127.0.0.1:8765/epochs.json, so serve a copy of the table
+# there; only the table, never the rest of keys/.
 TWODOC=$WORK/twodoc.html
+mkdir -p "$WORK/served"; cp "$TABLE_FILE" "$WORK/served/epochs.json"
+if curl -s -o /dev/null "http://127.0.0.1:8765/" 2>/dev/null; then
+  echo "  FAIL port 8765 is already in use; the two-document sample needs it"; fail=$((fail+1))
+fi
+(cd "$WORK/served" && exec python3 -m http.server 8765 --bind 127.0.0.1) >/dev/null 2>&1 & SAMPLE_HTTP_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf http://127.0.0.1:8765/epochs.json >/dev/null && break; sleep 0.5; done
 load_dotnet
-(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-    --table "$ROOT/keys/epochs.json" --in "$ROOT/samples/page-two-documents.html" \
-    --out "$TWODOC" >/dev/null 2>&1) \
-  || { echo "  FAIL could not seal the two-document page"; fail=$((fail+1)); }
+TWODOC_OUT=$(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
+    --in "$ROOT/samples/page-two-documents.html" --out "$TWODOC" 2>&1) \
+  || { echo "  FAIL could not seal the two-document page: $TWODOC_OUT"; fail=$((fail+1)); }
+kill "$SAMPLE_HTTP_PID" 2>/dev/null; wait "$SAMPLE_HTTP_PID" 2>/dev/null
+check "its table came over http" "$TWODOC_OUT" "table   : http://127.0.0.1:8765/epochs.json (signature verified" y
 check "neither document leaks" "$(cat "$TWODOC")" "SEALED-FIRST-DOC-OK"  n
 check "nor the other"          "$(cat "$TWODOC")" "SEALED-SECOND-DOC-OK" n
 load_chrome
@@ -655,13 +684,13 @@ echo "== a page may supply its own controls, wording and styles"
 CUSTOM=$WORK/custom.html
 load_dotnet
 CUSTOM_OUT=$(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
-    --table "$ROOT/keys/epochs.json" --in "$ROOT/samples/page-custom-layout.html" \
+    --in "$ROOT/samples/page-custom-layout.html" \
     --out "$CUSTOM" 2>&1) \
   || { echo "  FAIL could not seal the custom page"; fail=$((fail+1)); }
 check "defaults left out"        "$CUSTOM_OUT" "the page's own"        y
 check "no default style rules"   "$(cat "$CUSTOM")" "reportseal-locked {" n
 load_chrome
-TOKEN_TIER=$(load_php; php php/issue.php --epoch E1 --page $PAGE --kid tiered \
+TOKEN_TIER=$(load_php; issue --epoch E1 --page $PAGE --kid tiered \
     --exp 2027-01-31 --name 'A. Example' --institution 'Example Institute' \
     --extra '{"tier":"gold"}' 2>/dev/null)
 load_chrome
@@ -752,6 +781,144 @@ echo "== garbage input is rejected"
 DOM=$(run_case garbage "not-a-key")
 check "malformed reported"   "$DOM" "does not look like a key" y
 check "content stays hidden" "$DOM" "SEALED-SAMPLE-OK"           n
+
+echo "== the key table named by the markers"
+# Table: is required, read and signature-checked by ReportSeal.Pages itself.
+TT=$WORK/tables; mkdir -p "$TT"
+cp "$TABLE_FILE" "$TT/epochs.json"
+python3 - "$TT" <<'PYEOF'
+import json, sys
+d = sys.argv[1]
+t = json.load(open(d + '/epochs.json'))
+# same content, different layout: the canonical form must still verify
+json.dump(t, open(d + '/reformatted.json', 'w'), indent=3, sort_keys=False)
+x = dict(t); x['epochs'] = dict(t['epochs']); x['epochs']['E1'] = t['epochs']['E2']
+json.dump(x, open(d + '/tampered.json', 'w'))
+x = dict(t); x['epochs'] = dict(t['epochs']); x['epochs']['E9'] = t['epochs']['E1']
+json.dump(x, open(d + '/added-epoch.json', 'w'))
+x = dict(t); del x['signature']
+json.dump(x, open(d + '/unsigned.json', 'w'))
+PYEOF
+# $1 tag, $2 Table: value for every marker, optional $3 Table: for a second marker
+table_page() {
+  local src=$TT/$1-src.html
+  {
+    echo '<!DOCTYPE html><html><head><title>x</title></head><body>'
+    echo "<!-- ReportSeal PageID: $PAGE, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: $2 -->"
+    echo '<p>SEALED-TABLE-OK</p><!-- EndOfReportSeal -->'
+    if [ -n "${3:-}" ]; then
+      echo "<!-- ReportSeal PageID: $PAGE, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true, Table: $3 -->"
+      echo '<p>SECOND</p><!-- EndOfReportSeal -->'
+    fi
+    echo '</body></html>'
+  } > "$src"
+  echo "$src"
+}
+# $1 tag, $2 description, $3 expected substring in the generator's output, then table_page args
+expect_table() {
+  local tag=$1 desc=$2 want=$3; shift 3
+  local src out
+  src=$(table_page "$tag" "$@")
+  out=$(cd dotnet/ReportSeal.Generator && dotnet run --no-build -- \
+        --in "$src" --out "$TT/$tag.html" 2>&1)
+  if grep -qF -- "$want" <<<"$out"; then
+    pass=$((pass+1)); printf '  ok   %s\n' "$desc"
+  else
+    fail=$((fail+1)); printf '  FAIL %s: expected "%s", got: %s\n' "$desc" "$want" "$(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  fi
+}
+load_dotnet
+expect_table barepath  "a path without file:// is refused"        "has no scheme"        "$TT/epochs.json"
+expect_table barerel   "a relative path without file:// is refused" "has no scheme"      "../../../../../keys/epochs.json"
+expect_table fileuri   "a file:// URI is read"                    "signature verified"   "file://$TT/epochs.json"
+expect_table relpath   "a relative file:// path is taken from the executable" "signature verified" "file://../../../../../keys/epochs.json"
+expect_table layout    "a re-laid-out table still verifies"       "signature verified"   "file://$TT/reformatted.json"
+expect_table tampered  "a table with an altered epoch is refused" "does not verify"      "file://$TT/tampered.json"
+expect_table added     "a table with an added epoch is refused"   "does not verify"      "file://$TT/added-epoch.json"
+expect_table unsigned  "an unsigned table is refused"             "is not signed"        "file://$TT/unsigned.json"
+expect_table missing   "a missing table is refused"               "could not read the key table" "file://$TT/nope.json"
+expect_table ftp       "an ftp: location is refused"              "only https://, http:// and file://" "ftp://127.0.0.1/epochs.json"
+expect_table mixed     "two tables on one page are refused"       "must use the same table" "file://$TT/epochs.json" "file://$TT/reformatted.json"
+expect_table samefile  "one table spelled two ways is accepted"   "signature verified"   "file://$TT/epochs.json" "file://$TT/../tables/epochs.json"
+grep -q 'SEALED-TABLE-OK' "$TT/tampered.html" 2>/dev/null \
+  && { fail=$((fail+1)); echo "  FAIL a refused table still produced a page"; } \
+  || { pass=$((pass+1)); echo "  ok   a refused table writes no page"; }
+
+# over the network, from a local Python server
+PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+(cd "$TT" && exec python3 -m http.server "$PORT" --bind 127.0.0.1) >/dev/null 2>&1 & HTTP_PID=$!
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=127.0.0.1 \
+  -addext subjectAltName=IP:127.0.0.1 -keyout "$TT/tls.key" -out "$TT/tls.crt" >/dev/null 2>&1
+SPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 - "$TT" "$SPORT" >/dev/null 2>&1 <<'PYEOF' & HTTPS_PID=$!
+import http.server, os, ssl, sys
+d, port = sys.argv[1], int(sys.argv[2])
+os.chdir(d)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(d + '/tls.crt', d + '/tls.key')
+srv = http.server.HTTPServer(('127.0.0.1', port), http.server.SimpleHTTPRequestHandler)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PYEOF
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  curl -sf "http://127.0.0.1:$PORT/epochs.json" >/dev/null && curl -sfk "https://127.0.0.1:$SPORT/epochs.json" >/dev/null && break
+  sleep 0.5
+done
+if curl -sf "http://127.0.0.1:$PORT/epochs.json" >/dev/null && curl -sfk "https://127.0.0.1:$SPORT/epochs.json" >/dev/null; then
+  pass=$((pass+1)); echo "  ok   the http and https test servers are up"
+else
+  fail=$((fail+1)); echo "  FAIL the http or https test server did not start"
+fi
+expect_table http      "an http:// URL is fetched"                "signature verified"   "http://127.0.0.1:$PORT/epochs.json"
+expect_table http404   "an http:// URL that is not there is refused" "could not read the key table" "http://127.0.0.1:$PORT/nope.json"
+expect_table httptamp  "a tampered table over http is refused"    "does not verify"      "http://127.0.0.1:$PORT/tampered.json"
+# the throwaway certificate is trusted for this one run only
+SSL_CERT_FILE=$TT/tls.crt expect_table https "an https:// URL is fetched" "signature verified" "https://127.0.0.1:$SPORT/epochs.json"
+expect_table httpsbad  "an https:// server with an untrusted certificate is refused" "could not read the key table" "https://127.0.0.1:$SPORT/epochs.json"
+kill "$HTTP_PID" "$HTTPS_PID" 2>/dev/null; wait "$HTTP_PID" "$HTTPS_PID" 2>/dev/null
+
+echo "== the Unity WebGL signature bridge, run in the browser"
+# unity/ReportSealEcdsa.jslib with Unity's heap, string marshalling and SendMessage
+# simulated, checking a table PHP signed. Unity itself is not involved.
+load_php
+php -r 'require "php/lib/reportseal.php";
+$t = json_decode(file_get_contents($argv[1]), true); $sig = $t["signature"]; unset($t["signature"]);
+echo json_encode(["data" => base64_encode(canonical_json($t)), "x" => $t["signpublic"]["x"],
+                  "y" => $t["signpublic"]["y"], "sig" => $sig]);' "$TABLE_FILE" > "$TT/bridge-input.json"
+python3 - "$ROOT/unity/ReportSealEcdsa.jslib" "$TT/bridge-input.json" "$TT/bridge.html" <<'PYEOF'
+import sys
+lib, data, out = (open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3])
+open(out, 'w').write('''<!DOCTYPE html><html><body><pre id="out"></pre><script>
+var LibraryManager = { library: {} };
+function mergeInto(target, fns) { Object.assign(target, fns); }
+''' + lib + '''
+var lib = LibraryManager.library, input = ''' + data + ''';
+var HEAPU8 = new Uint8Array(1 << 16), heapTop = 8;
+function put(bytes) { var at = heapTop; HEAPU8.set(bytes, at); heapTop += bytes.length + 8; return at; }
+function cstr(s) { return put(new TextEncoder().encode(s + "\\0")); }
+function UTF8ToString(p) { var e = p; while (HEAPU8[e]) e++; return new TextDecoder().decode(HEAPU8.subarray(p, e)); }
+function b64u(s) { var b = atob(s.replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from(b, function (c) { return c.charCodeAt(0); }); }
+var data = Uint8Array.from(atob(input.data), function (c) { return c.charCodeAt(0); });
+var altered = new TextEncoder().encode(new TextDecoder().decode(data).replace('"E1"', '"E9"'));
+var key = new Uint8Array(65); key[0] = 4; key.set(b64u(input.x), 1); key.set(b64u(input.y), 33);
+var cases = [["valid", data, key], ["altered", altered, key], ["badkey", data, new Uint8Array(65).fill(7)]];
+var replies = 0;
+var unityInstance = { SendMessage: function (o, m, msg) {
+  document.getElementById("out").textContent += "BRIDGE " + o + "." + m + " " + msg + "\\n"; } };
+cases.forEach(function (c, i) {
+  var sig = b64u(input.sig), kp = put(c[2]), sp = put(sig), dp = put(c[1]);
+  lib.ReportSealVerifyEcdsa(kp, c[2].length, sp, sig.length, dp, c[1].length, cstr("Verifier"), cstr("OnReportSealVerified"), i + 1);
+  HEAPU8.fill(0xEE, kp, heapTop);  // the bridge must already have copied its inputs
+});
+</script></body></html>''')
+PYEOF
+load_chrome
+DOM=$("$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+      --user-data-dir="$WORK/profile-bridge" --virtual-time-budget=5000 \
+      --dump-dom "file://$TT/bridge.html" 2>/dev/null | grep -o 'BRIDGE [^<]*' | tr '\n' ' ')
+check "PHP's signature verifies in WebCrypto" "$DOM" "Verifier.OnReportSealVerified 1:OK:true"  y
+check "an altered table does not"             "$DOM" "OnReportSealVerified 2:OK:false"          y
+check "an unusable key reports an error"      "$DOM" "OnReportSealVerified 3:ERR:"              y
 
 echo
 echo "$pass passed, $fail failed"

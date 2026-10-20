@@ -1,27 +1,22 @@
 <?php
 /**
- * issue.php — mint one decryption token. This is the only place the epoch private
- * key and the issuer signing key are ever read.
+ * issue.php — mint one decryption token for one page.
  *
- *   php issue.php --page DOC-1234
- *   php issue.php --page DOC-1234 --kid acct-4471 --name 'A. Example' --institution 'Example Institute'
- *   php issue.php --page DOC-1234 --exp 2027-01-31   # reported, never enforced
- *   php issue.php --page DOC-1234 --extra '{"tier":"gold"}'
+ *   php issue.php --page DOC-1234 --epoch E1
+ *   php issue.php --page DOC-1234 --epoch E1 --kid acct-4471 --name 'A. Example'
+ *   php issue.php --page DOC-1234 --epoch E1 --exp 2027-01-31 --extra '{"tier":"gold"}'
  *
- * One key per invocation, each with its own data block. Callers that issue keys
- * programmatically should require lib/reportseal.php and call mint_token() directly.
+ * Needs the signing key password and the epoch's password. Each comes from
+ * --signing-password / --epoch-password if given, otherwise from the terminal
+ * without echo, or a line on stdin when that is a pipe (signing password first).
+ * A password on the command line is visible in the process list while this runs
+ * and lands in shell history unless the shell is told otherwise.
  *
- * Token format:  NO1.<base64url(payload)>.<base64url(r||s)>
- *   payload = {"v":2,"epoch":...,"page":...,"sk":<page private element>,
- *              "extra":{"kid":...,"name":...,"institution":...,"exp":...}}
+ * Each issued key is recorded in the log and, if configured, the database before
+ * the token is printed; if recording fails, no token is printed.
  *
- * Only the epoch, page and element are crypto; everything else is metadata in
- * "extra". The element opens exactly this page: a key for another page cannot be
- * turned into a key for this one. The ECDSA signature is what stops a holder from
- * editing their own metadata or minting tokens of their own.
- *
- * "exp" is a signed notice only: the page still decrypts and simply reports that
- * the key is past its date. Withdrawal is done by rotating the epoch.
+ * Without --epoch the last epoch in the table is used, which is rarely what a page
+ * was sealed under, so passing it is advisable.
  */
 
 declare(strict_types=1);
@@ -30,23 +25,27 @@ require __DIR__ . '/lib/reportseal.php';
 $epoch = null;
 $pageId = null;
 $opts = [];
+$signingPassword = null;
+$epochPassword = null;
 
 for ($i = 1; $i < $argc; $i++) {
     switch ($argv[$i]) {
-        case '--epoch':       $epoch = $argv[++$i] ?? ''; break;
-        case '--page':        $pageId = $argv[++$i] ?? ''; break;
-        case '--kid':         $opts['kid'] = $argv[++$i] ?? ''; break;
-        case '--exp':         $opts['exp'] = $argv[++$i] ?? ''; break;
-        case '--name':        $opts['name'] = $argv[++$i] ?? ''; break;
-        case '--institution': $opts['institution'] = $argv[++$i] ?? ''; break;
+        case '--epoch':            $epoch = $argv[++$i] ?? ''; break;
+        case '--page':             $pageId = $argv[++$i] ?? ''; break;
+        case '--kid':              $opts['kid'] = $argv[++$i] ?? ''; break;
+        case '--exp':              $opts['exp'] = $argv[++$i] ?? ''; break;
+        case '--name':             $opts['name'] = $argv[++$i] ?? ''; break;
+        case '--institution':      $opts['institution'] = $argv[++$i] ?? ''; break;
+        case '--signing-password': $signingPassword = $argv[++$i] ?? ''; break;
+        case '--epoch-password':   $epochPassword = $argv[++$i] ?? ''; break;
         case '--extra':
-            // decoded as an array so it merges into the metadata block
             $opts['extra'] = json_decode($argv[++$i] ?? '{}', true, 512, JSON_THROW_ON_ERROR);
             break;
         default:
             fwrite(STDERR, "unknown argument: {$argv[$i]}\n");
             fwrite(STDERR, "usage: issue.php --page <id> [--epoch E1] [--kid <id>] [--exp <date>]\n"
-                         . "                 [--name <text>] [--institution <text>] [--extra <json>]\n");
+                         . "                 [--name <text>] [--institution <text>] [--extra <json>]\n"
+                         . "                 [--signing-password <pw>] [--epoch-password <pw>]\n");
             exit(1);
     }
 }
@@ -62,7 +61,27 @@ try {
         }
         $epoch = end($epochs);
     }
-    echo mint_token($epoch, $pageId, $opts), "\n";
+
+    $issuer = unlock_issuer(
+        $epoch,
+        $signingPassword ?? read_password('Signing key password: '),
+        $epochPassword ?? read_password("Password for epoch $epoch: ")
+    );
+    if (!isset($opts['kid']) || $opts['kid'] === '') {
+        $opts['kid'] = random_kid();
+    }
+    $token = mint_token($issuer, $pageId, $opts);
+
+    record_issue([
+        'kid'         => $opts['kid'],
+        'epoch'       => $epoch,
+        'page'        => $pageId,
+        'name'        => (string) ($opts['name'] ?? 'unknown'),
+        'institution' => (string) ($opts['institution'] ?? 'unknown'),
+        'exp'         => isset($opts['exp']) && $opts['exp'] !== '' ? normalise_exp($opts['exp']) : null,
+    ], 'cli');
+
+    echo $token, "\n";
     // on stderr so stdout stays exactly the token
     fwrite(STDERR, 'page identity ' . page_fingerprint($pageId) . " for '$pageId'\n");
 } catch (RuntimeException $e) {

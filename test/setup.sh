@@ -7,13 +7,15 @@
 #   test/setup.sh            create whatever is missing, then publish the table
 #   test/setup.sh --force    throw the key store away and build it again
 #
-# This is separate from e2e.sh for two reasons. Publishing the table derives every
-# epoch's public half, one G2 multiply apiece, which cost the suite about 14
-# seconds on every run. And a test run should not quietly rewrite your keys.
+# Keys are encrypted at rest, so the suite needs their passwords. These are
+# throwaway development keys, so this script keeps the passwords it generates in
+# out/fixture-passwords (mode 0600, ignored by git) for e2e.sh to read. Deleting
+# out/ loses them, and the next run of this script rebuilds the key store. Nothing in
+# php/ ever writes a password down; this file exists only for the test fixtures.
 set -u
 
 cd "$(dirname "$0")/.."
-ROOT=$PWD
+FIXTURE=out/fixture-passwords
 
 if [ -f test/env.sh ]; then
   . test/env.sh
@@ -30,25 +32,54 @@ for arg in "$@"; do
   esac
 done
 
-if [ "$force" -eq 1 ]; then
-  echo "removing the existing key store"
-  rm -rf keys/private keys/epochs.json keys/signpublic.pem keys/issued.log
+if [ "$force" -eq 1 ] || [ ! -f "$FIXTURE" ]; then
+  [ "$force" -eq 1 ] && echo "removing the existing key store"
+  # without the fixture file the suite cannot unlock existing keys, so start over
+  rm -rf keys/private keys/epochs.json keys/signpublic.pem keys/issued.log "$FIXTURE"
 fi
 
-# The first run creates the signing key as well; the second adds the epoch.
-php php/setup.php            >/dev/null || { echo "setup failed for E1" >&2; exit 1; }
-php php/setup.php --epoch E2 >/dev/null || { echo "setup failed for E2" >&2; exit 1; }
-php php/setup.php --epoch E3 >/dev/null || { echo "setup failed for E3" >&2; exit 1; }
+signing=""
+declare -A epoch_pw=()
+if [ -f "$FIXTURE" ]; then
+  while IFS='=' read -r name value; do
+    case $name in
+      SIGN) signing=$value ;;
+      E*)   epoch_pw[$name]=$value ;;
+    esac
+  done < "$FIXTURE"
+fi
+if [ -z "$signing" ]; then
+  # letters and digits only, so the value needs no quoting anywhere
+  signing="Test$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+fi
+
+for epoch in E1 E2 E3; do
+  out=$(php php/setup.php --epoch "$epoch" --signing-password "$signing" 2>&1) \
+    || { echo "setup failed for $epoch:" >&2; echo "$out" >&2; exit 1; }
+  generated=$(sed -n "s/^  Password for epoch $epoch: //p" <<<"$out")
+  [ -n "$generated" ] && epoch_pw[$epoch]=$generated
+done
+
+umask 077
+mkdir -p out
+{
+  echo "SIGN=$signing"
+  for epoch in E1 E2 E3; do echo "$epoch=${epoch_pw[$epoch]:-}"; done
+} > "$FIXTURE"
+chmod 600 "$FIXTURE"
 
 python3 - <<'PY'
 import json, os, sys
 table = json.load(open('keys/epochs.json'))
 epochs = list(table['epochs'])
 print('epochs published :', ', '.join(epochs))
-print('verification key :', 'keys/signpublic.pem', f"({os.path.getsize('keys/signpublic.pem')} bytes)")
+print('table signed     :', 'yes' if table.get('signature') else 'NO')
 print('private material :', ', '.join(sorted(os.listdir('keys/private'))))
 missing = [e for e in ('E1', 'E2', 'E3') if e not in epochs]
 if missing:
     print('ERROR: the suite needs ' + ', '.join(missing), file=sys.stderr)
     sys.exit(1)
 PY
+for epoch in E1 E2 E3; do
+  [ -n "${epoch_pw[$epoch]:-}" ] || { echo "ERROR: no password recorded for $epoch; run test/setup.sh --force" >&2; exit 1; }
+done

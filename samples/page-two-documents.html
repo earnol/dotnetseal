@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<!-- This sample reads its key table over http, so serve one before sealing it:
+       mkdir -p out/served && cp keys/epochs.json out/served/
+       (cd out/served && python3 -m http.server 8765 --bind 127.0.0.1)
+     Plain http is for local testing only; publish the table over https. -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Two Documents, One Page</title>
@@ -25,7 +29,8 @@
 here: with two page ids there is no single key to attribute the page to, so each
 section's key is reported beside its own entry box.</p>
 
-<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-1234, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true,
+     Table: http://127.0.0.1:8765/epochs.json -->
 <h2>First document</h2>
 <p>SEALED-FIRST-DOC-OK — this region is sealed under page id DOC-1234. A key issued
 for DOC-5678 cannot open it, and the refusal is cryptographic rather than a check
@@ -34,7 +39,8 @@ the page performs.</p>
 
 <p>An unsealed paragraph separating the two documents.</p>
 
-<!-- ReportSeal PageID: DOC-5678, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true -->
+<!-- ReportSeal PageID: DOC-5678, Epoch: E1, Compress: true, EnforceExpiry: false, ShowAttribution: true,
+     Table: http://127.0.0.1:8765/epochs.json -->
 <h2>Second document</h2>
 <p>SEALED-SECOND-DOC-OK — this region is sealed under page id DOC-5678. Holding a
 key for only one of the two documents reveals only that document, which is how one
